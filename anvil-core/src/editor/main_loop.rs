@@ -283,6 +283,33 @@ fn save_expanded_folders(
     }
 }
 
+/// Re-expand sidebar directories from an in-memory set of previously expanded paths.
+fn expand_sidebar_from_set(
+    sidebar_entries: &mut Vec<SidebarEntry>,
+    expanded: &HashSet<String>,
+    show_hidden: bool,
+) {
+    let mut i = 0;
+    while i < sidebar_entries.len() {
+        if sidebar_entries[i].is_dir
+            && !sidebar_entries[i].expanded
+            && expanded.contains(&sidebar_entries[i].path)
+        {
+            sidebar_entries[i].expanded = true;
+            let children = scan_directory(
+                &sidebar_entries[i].path,
+                sidebar_entries[i].depth + 1,
+                show_hidden,
+            );
+            let insert_at = i + 1;
+            for (j, child) in children.into_iter().enumerate() {
+                sidebar_entries.insert(insert_at + j, child);
+            }
+        }
+        i += 1;
+    }
+}
+
 /// A file-type icon: Seti font codepoint + color.
 struct FileIcon {
     /// Unicode codepoint in the Seti icon font.
@@ -420,6 +447,76 @@ impl AutoreloadState {
                             }
                         }
                     }
+                }
+            }
+        }
+        changed
+    }
+}
+
+/// Watches project directories so the sidebar refreshes when the filesystem changes.
+struct SidebarWatcher {
+    watcher: Option<notify::RecommendedWatcher>,
+    rx: Option<Receiver<notify::Result<Event>>>,
+    watched_dirs: HashSet<PathBuf>,
+}
+
+impl SidebarWatcher {
+    fn new() -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let watcher = notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        })
+        .ok();
+        Self { watcher, rx: Some(rx), watched_dirs: HashSet::new() }
+    }
+
+    fn watch_dir(&mut self, dir: &str) {
+        let path = PathBuf::from(dir);
+        if self.watched_dirs.contains(&path) {
+            return;
+        }
+        if let Some(ref mut w) = self.watcher {
+            if w.watch(&path, RecursiveMode::NonRecursive).is_ok() {
+                self.watched_dirs.insert(path);
+            }
+        }
+    }
+
+    fn unwatch_dir(&mut self, dir: &str) {
+        let path = PathBuf::from(dir);
+        if self.watched_dirs.remove(&path) {
+            if let Some(ref mut w) = self.watcher {
+                let _ = w.unwatch(&path);
+            }
+        }
+    }
+
+    fn unwatch_all(&mut self) {
+        let dirs: Vec<PathBuf> = self.watched_dirs.drain().collect();
+        if let Some(ref mut w) = self.watcher {
+            for dir in &dirs {
+                let _ = w.unwatch(dir);
+            }
+        }
+    }
+
+    /// Returns true if any directory-listing change (create/remove/rename) was detected.
+    fn poll_changed(&self) -> bool {
+        let Some(ref rx) = self.rx else {
+            return false;
+        };
+        let mut changed = false;
+        while let Ok(event) = rx.try_recv() {
+            if let Ok(ev) = event {
+                use notify::EventKind;
+                if matches!(
+                    ev.kind,
+                    EventKind::Create(_)
+                        | EventKind::Remove(_)
+                        | EventKind::Modify(notify::event::ModifyKind::Name(_))
+                ) {
+                    changed = true;
                 }
             }
         }
@@ -862,6 +959,7 @@ pub fn run(
     let mut mouse_x: f64 = 0.0;
     let mut mouse_y: f64 = 0.0;
     let mut sidebar_entries: Vec<SidebarEntry>;
+    let mut sidebar_watcher = SidebarWatcher::new();
     let mut sidebar_scroll: f64 = 0.0;
     // Content height + scrollbar track geometry captured during the sidebar
     // draw so the click/drag paths can reuse the same numbers instead of
@@ -934,6 +1032,14 @@ pub fn run(
             sidebar_show_hidden,
             &project_session_key(&project_root),
         );
+        if !project_root.is_empty() {
+            sidebar_watcher.watch_dir(&project_root);
+            for entry in &sidebar_entries {
+                if entry.is_dir && entry.expanded {
+                    sidebar_watcher.watch_dir(&entry.path);
+                }
+            }
+        }
     }
 
     // Recent projects list (persisted).
@@ -2208,6 +2314,7 @@ pub fn run(
                                                 cmdview_active = false;
                                                 project_root = path;
                                                 if subsystems.has_sidebar() {
+                                                    sidebar_watcher.unwatch_all();
                                                     sidebar_entries = scan_for_sidebar(
                                                         subsystems.has_notes_mode(),
                                                         &project_root,
@@ -2219,6 +2326,13 @@ pub fn run(
                                                         sidebar_show_hidden,
                                                         &project_session_key(&project_root),
                                                     );
+                                                    sidebar_watcher.watch_dir(&project_root);
+                                                    for entry in &sidebar_entries {
+                                                        if entry.is_dir && entry.expanded {
+                                                            sidebar_watcher
+                                                                .watch_dir(&entry.path);
+                                                        }
+                                                    }
                                                     sidebar_visible = true;
                                                     if let Some(tab) = restore_project_session(
                                                         userdir_path,
@@ -2275,6 +2389,7 @@ pub fn run(
                                                 active_tab = 0;
                                                 project_root = path;
                                                 if subsystems.has_sidebar() {
+                                                    sidebar_watcher.unwatch_all();
                                                     sidebar_entries = scan_for_sidebar(
                                                         subsystems.has_notes_mode(),
                                                         &project_root,
@@ -2286,6 +2401,13 @@ pub fn run(
                                                         sidebar_show_hidden,
                                                         &project_session_key(&project_root),
                                                     );
+                                                    sidebar_watcher.watch_dir(&project_root);
+                                                    for entry in &sidebar_entries {
+                                                        if entry.is_dir && entry.expanded {
+                                                            sidebar_watcher
+                                                                .watch_dir(&entry.path);
+                                                        }
+                                                    }
                                                     sidebar_visible = true;
                                                     if let Some(tab) = restore_project_session(
                                                         userdir_path,
@@ -4814,6 +4936,16 @@ pub fn run(
                                     {
                                         remove_end += 1;
                                     }
+                                    sidebar_watcher.unwatch_dir(&path);
+                                    for entry in sidebar_entries
+                                        .iter()
+                                        .take(remove_end)
+                                        .skip(remove_start)
+                                    {
+                                        if entry.is_dir && entry.expanded {
+                                            sidebar_watcher.unwatch_dir(&entry.path.clone());
+                                        }
+                                    }
                                     sidebar_entries.drain(remove_start..remove_end);
                                 } else {
                                     // Expand: insert children.
@@ -4824,6 +4956,7 @@ pub fn run(
                                     for (i, child) in children.into_iter().enumerate() {
                                         sidebar_entries.insert(insert_at + i, child);
                                     }
+                                    sidebar_watcher.watch_dir(&path);
                                 }
                             } else {
                                 // Open file as new tab (if not already open).
@@ -6908,6 +7041,29 @@ pub fn run(
                         break;
                     }
                 }
+            }
+
+            // Sidebar watcher: refresh when files are created/deleted/renamed.
+            if subsystems.has_sidebar()
+                && !project_root.is_empty()
+                && sidebar_watcher.poll_changed()
+            {
+                let expanded: HashSet<String> = sidebar_entries
+                    .iter()
+                    .filter(|e| e.is_dir && e.expanded)
+                    .map(|e| e.path.clone())
+                    .collect();
+                sidebar_entries =
+                    scan_for_sidebar(subsystems.has_notes_mode(), &project_root, sidebar_show_hidden);
+                expand_sidebar_from_set(&mut sidebar_entries, &expanded, sidebar_show_hidden);
+                sidebar_watcher.unwatch_all();
+                sidebar_watcher.watch_dir(&project_root);
+                for entry in &sidebar_entries {
+                    if entry.is_dir && entry.expanded {
+                        sidebar_watcher.watch_dir(&entry.path);
+                    }
+                }
+                redraw = true;
             }
 
             // Notes-mode autosave: any dirty doc that has been idle (no

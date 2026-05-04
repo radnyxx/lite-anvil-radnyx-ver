@@ -1,5 +1,9 @@
 # Change Log
 
+## [2.11.16] - 2026-05-01 -- Sidebar filesystem change detection.
+
+* Sidebar now updates as files and folders change in the active project.
+
 ## [2.11.15] - 2026-05-01 -- Fix text visibility on resize.
 
 * Resize now renders all text.
