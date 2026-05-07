@@ -2519,6 +2519,8 @@ pub fn run(
                                                         .file_name()
                                                         .map(|n| n.to_string_lossy().to_string())
                                                         .unwrap_or_else(|| save_path.clone());
+                                                    doc.cached_change_id = -1;
+                                                    doc.cached_render = std::sync::Arc::new(Vec::new());
                                                     autoreload.watch(&save_path);
                                                     log_to_file(userdir, &format!("Saved {save_path}"));
                                                     info_message = Some((format!("Saved {}", doc.name), Instant::now()));
@@ -3232,6 +3234,8 @@ pub fn run(
                                                 .file_name()
                                                 .map(|n| n.to_string_lossy().to_string())
                                                 .unwrap_or_else(|| save_path.clone());
+                                            doc.cached_change_id = -1;
+                                            doc.cached_render = std::sync::Arc::new(Vec::new());
                                             autoreload.watch(&save_path);
                                             log_to_file(userdir, &format!("Saved {save_path}"));
                                             info_message = Some((
@@ -3293,6 +3297,8 @@ pub fn run(
                                                 .file_name()
                                                 .map(|n| n.to_string_lossy().to_string())
                                                 .unwrap_or_else(|| save_path.clone());
+                                            doc.cached_change_id = -1;
+                                            doc.cached_render = std::sync::Arc::new(Vec::new());
                                             autoreload.watch(&save_path);
                                             log_to_file(userdir, &format!("Saved {save_path}"));
                                             info_message = Some((
@@ -3386,6 +3392,8 @@ pub fn run(
                                                     .file_name()
                                                     .map(|n| n.to_string_lossy().to_string())
                                                     .unwrap_or_else(|| save_path.clone());
+                                                doc.cached_change_id = -1;
+                                                doc.cached_render = std::sync::Arc::new(Vec::new());
                                             }
                                             autoreload.watch(&save_path);
                                             log_to_file(userdir, &format!("Saved {save_path}"));
@@ -3675,7 +3683,45 @@ pub fn run(
                                 redraw = true;
                                 continue;
                             }
-                            "return" | "keypad enter" if mods.ctrl && replace_active => {
+                            "return" | "keypad enter" if mods.ctrl && mods.shift && replace_active => {
+                                if let Some(doc) = docs.get_mut(active_tab) {
+                                    let dv = &mut doc.view;
+                                    let mut count = 0usize;
+                                    loop {
+                                        let sel = if find_in_selection {
+                                            find_selection_range
+                                        } else {
+                                            None
+                                        };
+                                        let matches = compute_find_matches_filtered(
+                                            dv,
+                                            &find_query,
+                                            find_use_regex,
+                                            find_whole_word,
+                                            find_case_insensitive,
+                                            sel,
+                                        );
+                                        if matches.is_empty() {
+                                            break;
+                                        }
+                                        select_find_match(dv, matches[0], replace_active);
+                                        replace_current_match(dv, &find_query, &replace_query);
+                                        count += 1;
+                                        if count > 100_000 {
+                                            break;
+                                        }
+                                    }
+                                    find_matches.clear();
+                                    find_current = None;
+                                    info_message = Some((
+                                        format!("Replaced {count} occurrence(s)"),
+                                        Instant::now(),
+                                    ));
+                                }
+                                redraw = true;
+                                continue;
+                            }
+                            "return" | "keypad enter" if mods.ctrl && !mods.shift && replace_active => {
                                 if let Some(doc) = docs.get_mut(active_tab) {
                                     let dv = &mut doc.view;
                                     replace_current_match(dv, &find_query, &replace_query);
@@ -8950,7 +8996,7 @@ pub fn run(
                         );
                         let repl_cursor = if find_focus_on_replace { "_" } else { "" };
                         let repl_label = format!(
-                            "Replace: {replace_query}{repl_cursor}  (Ctrl+Enter to replace)"
+                            "Replace: {replace_query}{repl_cursor}  (Ctrl+Enter replace  Ctrl+Shift+Enter all)"
                         );
                         draw_ctx.draw_text(
                             style.font,

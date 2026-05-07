@@ -1001,15 +1001,25 @@ match cmd.as_str() {
 "doc:reload" => {
     if let Some(doc) = docs.get_mut(active_tab) {
         if !doc.path.is_empty() {
-            if let Some(buf_id) = doc.view.buffer_id {
+            if doc_is_modified(doc) {
+                nag = Nag::ReloadFromDisk { path: doc.path.clone() };
+            } else if let Some(buf_id) = doc.view.buffer_id {
                 let path = doc.path.clone();
                 let _ = buffer::with_buffer_mut(buf_id, |b| {
                     let mut fresh = buffer::default_buffer_state();
                     let _ = buffer::load_file(&mut fresh, &path);
                     b.lines = fresh.lines;
-                    b.change_id += 1;
+                    b.change_id = b.change_id.wrapping_add(1).max(1);
                     Ok(())
                 });
+                if let Ok((cid, sig)) = buffer::with_buffer(buf_id, |b| {
+                    Ok((b.change_id, buffer::content_signature(&b.lines)))
+                }) {
+                    doc.saved_change_id = cid;
+                    doc.saved_signature = sig;
+                }
+                doc.cached_change_id = -1;
+                doc.cached_render = std::sync::Arc::new(Vec::new());
             }
         }
     }

@@ -1,5 +1,11 @@
 # Change Log
 
+## [2.11.17] - 2026-05-05 -- Replace-all, syntax on save-as, reload command.
+
+* Added replace-all to the replace dialog (Ctrl+Shift+Enter).
+* Saving a new file via Save As now immediately applies syntax highlighting if the chosen extension matches a supported language. Previously the render cache was not invalidated on path change, so highlighting only appeared after the next buffer edit.
+* Added a "Reload" command to the command palette (`doc:reload`). Reloads the current file from disk.
+
 ## [2.11.16] - 2026-05-01 -- Sidebar filesystem change detection.
 
 * Sidebar now updates as files and folders change in the active project.
