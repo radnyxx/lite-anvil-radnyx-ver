@@ -2004,21 +2004,8 @@ pub fn run(
                                         if let Some(ref cmd) = item.command {
                                             let cmd = cmd.clone();
                                             context_menu.hide();
-                                            if let Some(doc) = docs.get_mut(active_tab) {
-                                                let marker = comment_marker_for_path(
-                                                    &doc.path,
-                                                    &syntax_index,
-                                                );
-                                                handle_doc_command(
-                                                    &mut doc.view,
-                                                    &cmd,
-                                                    &style,
-                                                    &doc.indent_type,
-                                                    doc.indent_size,
-                                                    marker.as_ref(),
-                                                    false,
-                                                    line_wrapping,
-                                                );
+                                            {
+                                                include!("commands_dispatch.rs");
                                             }
                                         } else {
                                             context_menu.hide();
@@ -4497,19 +4484,8 @@ pub fn run(
                                         redraw = true;
                                         continue;
                                     }
-                                    if let Some(doc) = docs.get_mut(active_tab) {
-                                        let marker =
-                                            comment_marker_for_path(&doc.path, &syntax_index);
-                                        handle_doc_command(
-                                            &mut doc.view,
-                                            &cmd,
-                                            &style,
-                                            &doc.indent_type,
-                                            doc.indent_size,
-                                            marker.as_ref(),
-                                            false,
-                                            line_wrapping,
-                                        );
+                                    {
+                                        include!("commands_dispatch.rs");
                                     }
                                     redraw = true;
                                     continue;
@@ -10782,6 +10758,68 @@ fn handle_doc_command(
     let Some(buf_id) = dv.buffer_id else { return };
     let line_h = style.code_font_height * 1.2;
 
+    match cmd {
+        "doc:copy" | "doc:cut" => {
+            let text =
+                buffer::with_buffer(buf_id, |b| Ok(buffer::get_selected_text(b)))
+                    .unwrap_or_default();
+            if !text.is_empty() {
+                crate::window::set_clipboard_text(&text);
+                if cmd == "doc:cut" {
+                    let _ = buffer::with_buffer_mut(buf_id, |b| {
+                        buffer::push_undo(b);
+                        buffer::delete_selection(b);
+                        Ok(())
+                    });
+                }
+            }
+            return;
+        }
+        "doc:paste" => {
+            if let Some(text) = crate::window::get_clipboard_text() {
+                let text = convert_paste_indent(&text, indent_type, indent_size);
+                let _ = buffer::with_buffer_mut(buf_id, |b| {
+                    buffer::push_undo(b);
+                    buffer::delete_selection(b);
+                    let line = b.selections[0];
+                    let col = b.selections[1];
+                    if line <= b.lines.len() {
+                        let l = &mut b.lines[line - 1];
+                        let byte_pos = char_to_byte(l, col - 1);
+                        let after = l[byte_pos..].to_string();
+                        l.truncate(byte_pos);
+                        let paste_lines: Vec<&str> = text.split('\n').collect();
+                        if paste_lines.len() == 1 {
+                            l.push_str(&text);
+                            l.push_str(&after);
+                            let new_col = col + text.chars().count();
+                            b.selections = vec![line, new_col, line, new_col];
+                        } else {
+                            l.push_str(paste_lines[0]);
+                            l.push('\n');
+                            let mut cur_line = line;
+                            for (i, pl) in paste_lines.iter().enumerate().skip(1) {
+                                cur_line += 1;
+                                if i == paste_lines.len() - 1 {
+                                    let new_col = pl.chars().count() + 1;
+                                    let mut new_line = pl.to_string();
+                                    new_line.push_str(&after);
+                                    b.lines.insert(cur_line - 1, new_line);
+                                    b.selections = vec![cur_line, new_col, cur_line, new_col];
+                                } else {
+                                    b.lines.insert(cur_line - 1, format!("{pl}\n"));
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            return;
+        }
+        _ => {}
+    }
+
     let mut prev_cursor_line: usize = 0;
     let _ = buffer::with_buffer_mut(buf_id, |b| {
         let anchor_line = *b.selections.first().unwrap_or(&1);
@@ -10835,12 +10873,6 @@ fn handle_doc_command(
                 b.selections[2] = last;
                 b.selections[3] = last_col;
                 return Ok(());
-            }
-            "doc:cut" | "doc:copy" => {
-                // TODO: clipboard integration
-            }
-            "doc:paste" => {
-                // TODO: clipboard integration
             }
             "doc:move-to-previous-char" | "doc:select-to-previous-char" => {
                 if col > 1 {

@@ -1,5 +1,9 @@
 # Change Log
 
+## [2.11.19] - 2026-05-11 -- Fix text copy in Nano-Anvil.
+
+* Fixed: selecting text and copying via Ctrl+C or the context menu "Copy" item did not update the clipboard in Nano-Anvil (and context menu copy was similarly broken in Lite-Anvil). Context menu commands (Copy, Cut, Paste, Undo, Redo, etc.) now dispatch through the same code path as keyboard shortcuts.
+
 ## [2.11.18] - 2026-05-10 -- Nano-Anvil mouse and update-check fixes.
 
 * Fixed: clicking the first line of text in Nano-Anvil did nothing.
