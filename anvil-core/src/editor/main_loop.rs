@@ -5044,7 +5044,7 @@ pub fn run(
                     }
 
                     // Tab bar click detection.
-                    let tab_h = if !docs.is_empty() {
+                    let tab_h = if !single_file_mode && !docs.is_empty() {
                         style.font_height + style.padding_y * 3.0
                     } else {
                         0.0
@@ -10735,6 +10735,20 @@ fn convert_paste_indent(text: &str, doc_indent_type: &str, doc_indent_size: usiz
 }
 
 /// Convert char index to byte index in a string.
+/// Returns true when `a` is a strictly greater semver than `b`.
+/// Compares major, minor, patch numerically; non-numeric segments fall back to
+/// lexicographic order so malformed tags don't panic.
+fn semver_gt(a: &str, b: &str) -> bool {
+    let parse = |s: &str| -> (u64, u64, u64) {
+        let mut parts = s.splitn(4, '.');
+        let major = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        let minor = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        let patch = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        (major, minor, patch)
+    };
+    parse(a) > parse(b)
+}
+
 fn char_to_byte(s: &str, char_idx: usize) -> usize {
     s.char_indices()
         .nth(char_idx)

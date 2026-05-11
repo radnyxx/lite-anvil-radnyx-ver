@@ -470,8 +470,10 @@ match cmd.as_str() {
                     info_message = Some(("Could not determine latest version".to_string(), Instant::now()));
                 } else if latest == current {
                     info_message = Some((format!("Up to date (v{current})"), Instant::now()));
-                } else {
+                } else if semver_gt(latest, current) {
                     info_message = Some((format!("New version available: v{latest} (current: v{current})"), Instant::now()));
+                } else {
+                    info_message = Some((format!("Up to date (v{current})"), Instant::now()));
                 }
             }
             _ => {

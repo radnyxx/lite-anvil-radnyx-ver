@@ -1,5 +1,11 @@
 # Change Log
 
+## [2.11.18] - 2026-05-10 -- Nano-Anvil mouse and update-check fixes.
+
+* Fixed: clicking the first line of text in Nano-Anvil did nothing.
+* Nano-Anvil now supports `core:check-for-updates` from the command palette.
+* check-for-updates handles numbers correctly.
+
 ## [2.11.17] - 2026-05-05 -- Replace-all, syntax on save-as, reload command.
 
 * Added replace-all to the replace dialog (Ctrl+Shift+Enter).
