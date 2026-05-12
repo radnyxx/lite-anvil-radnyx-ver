@@ -1,5 +1,11 @@
 # Change Log
 
+## [2.11.22] - 2026-05-12 -- Smart auto-indent, indent detection fix, smart backspace.
+
+* Smart auto-indent on Enter. After a line ending in `:`, `{`, `(`, or `[` (with optional trailing whitespace or line comment), the new line gets one extra indent unit on top of the previous line's leading whitespace — e.g. pressing Enter after `for a in sys.argv:` now lands the caret at the correct column. The indent unit honors the document's detected tab/space style and size.
+* Fixed: indent detection treated a uniformly-indented file as 2-space when it was actually 4-space. The old scoring required *multiple distinct* leading-space widths to vote for a candidate, so a file whose every indented line sat at depth 1 (e.g. `testy.py`) collapsed to the default. Detection is now frequency-weighted and picks the largest width in 1..=8 that explains the most observed indents — so a Python file with only 4-space lines reports 4.
+* Smart backspace. On a soft-indented document, when the caret is inside a run of leading spaces, Backspace now snaps back to the previous indent boundary instead of deleting one space at a time. Four leading spaces become zero in one keystroke; six leading spaces become four (aligning to the indent unit). Lines with non-space content before the caret, hard-tab documents, and the column-1 edge case keep their original single-character behavior.
+
 ## [2.11.21] - 2026-05-11 -- Python syntax highlighting fix, csproj and fsproj highlighting.
 
 * Fixed: pair-based syntax patterns (Python's `for ... :`, `if ... :`, `def ... :`, etc.) collapsed the entire match into one flat token, leaving inner identifiers, keywords, brackets, and the closing `:` un-highlighted. The tokenizer now matches pair opens, descends into sub-syntaxes for inner content, and pops on the proper close — matching the lite-xl 1.5.5 reference behavior. Captures inside patterns are now split into their typed segments as well (e.g. `# heading {#anchor}` no longer collapses to one keyword run).

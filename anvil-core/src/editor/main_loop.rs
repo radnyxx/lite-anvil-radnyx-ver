@@ -11114,6 +11114,83 @@ fn replace_current_match(dv: &mut DocView, find_query: &str, replacement: &str) 
     });
 }
 
+/// When the cursor sits inside a leading run of spaces, returns the number
+/// of characters backspace should delete to align with the previous indent
+/// boundary. Returns `None` when the normal single-character backspace
+/// should run instead (tab-indented documents, non-whitespace before cursor,
+/// or cursor at column 1).
+fn smart_backspace_span(
+    line_text: &str,
+    col: usize,
+    indent_type: &str,
+    indent_size: usize,
+) -> Option<usize> {
+    if indent_type != "soft" || col <= 1 || indent_size == 0 {
+        return None;
+    }
+    let leading = col - 1;
+    let prefix_is_all_spaces = line_text
+        .chars()
+        .take(leading)
+        .all(|c| c == ' ');
+    if !prefix_is_all_spaces {
+        return None;
+    }
+    let remove = if leading % indent_size == 0 {
+        indent_size
+    } else {
+        leading % indent_size
+    };
+    if remove >= 2 { Some(remove) } else { None }
+}
+
+/// Returns true when `prefix` (the line content before the cursor) ends —
+/// after trailing whitespace and a line-comment if any — with an
+/// open-block character: `:`, `{`, `(`, or `[`. Used to drive smart
+/// auto-indent on Enter.
+fn smart_indent_opens_block(prefix: &str) -> bool {
+    let stripped = strip_trailing_line_comment(prefix);
+    matches!(stripped.trim_end().chars().last(), Some(':' | '{' | '(' | '['))
+}
+
+/// Drop everything from the first `//`, `--`, or `#` line-comment marker.
+/// Tracks simple single/double-quoted strings so that markers inside a
+/// string literal are ignored. Heuristic only — does not understand raw
+/// strings, escape sequences beyond a single backslash, or nested
+/// comments — but it handles the common cases that drive smart-indent.
+fn strip_trailing_line_comment(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' || c == b'\'' {
+            quote = Some(c);
+            i += 1;
+            continue;
+        }
+        if (c == b'/' && bytes.get(i + 1) == Some(&b'/'))
+            || (c == b'-' && bytes.get(i + 1) == Some(&b'-'))
+            || c == b'#'
+        {
+            return &s[..i];
+        }
+        i += 1;
+    }
+    s
+}
+
 /// Convert pasted text's leading whitespace to match the document's indent
 /// style. Detects whether the clipboard content uses tabs or spaces, then
 /// re-indents every line to the target style (preserving relative depth).
@@ -11532,7 +11609,20 @@ fn handle_doc_command(
                     positions.sort_by(|a, bp| bp.1.cmp(&a.1).then(bp.2.cmp(&a.2)));
                     let mut results: Vec<(usize, usize, usize)> = Vec::new();
                     for &(idx, cline, ccol) in &positions {
-                        if ccol > 1 && cline <= b.lines.len() {
+                        if cline <= b.lines.len()
+                            && let Some(remove) = smart_backspace_span(
+                                &b.lines[cline - 1],
+                                ccol,
+                                indent_type,
+                                indent_size,
+                            )
+                        {
+                            let l = &mut b.lines[cline - 1];
+                            let bp = char_to_byte(l, ccol - 1 - remove);
+                            let ep = char_to_byte(l, ccol - 1);
+                            l.drain(bp..ep);
+                            results.push((idx, cline, ccol - remove));
+                        } else if ccol > 1 && cline <= b.lines.len() {
                             let l = &mut b.lines[cline - 1];
                             let bp = char_to_byte(l, ccol - 2);
                             let ep = char_to_byte(l, ccol - 1);
@@ -11564,7 +11654,18 @@ fn handle_doc_command(
                 buffer::delete_selection(b);
                 line = b.selections[0];
                 col = b.selections[1];
-                if col > 1 {
+                if let Some(remove) = smart_backspace_span(
+                    &b.lines[line - 1],
+                    col,
+                    indent_type,
+                    indent_size,
+                ) {
+                    let l = &mut b.lines[line - 1];
+                    let byte_start = char_to_byte(l, col - 1 - remove);
+                    let byte_end = char_to_byte(l, col - 1);
+                    l.drain(byte_start..byte_end);
+                    col -= remove;
+                } else if col > 1 {
                     let l = &mut b.lines[line - 1];
                     let byte_pos = char_to_byte(l, col - 2);
                     let end = char_to_byte(l, col - 1);
@@ -11635,7 +11736,6 @@ fn handle_doc_command(
                 buffer::delete_selection(b);
                 line = b.selections[0];
                 col = b.selections[1];
-                // Capture leading whitespace for auto-indent.
                 let indent: String = b.lines[line - 1]
                     .chars()
                     .take_while(|c| *c == ' ' || *c == '\t')
@@ -11643,10 +11743,20 @@ fn handle_doc_command(
                 let l = &mut b.lines[line - 1];
                 let byte_pos = char_to_byte(l, col - 1);
                 let rest = l[byte_pos..].to_string();
+                let before_cursor = l[..byte_pos].to_string();
                 l.truncate(byte_pos);
                 l.push('\n');
-                let new_line = format!("{indent}{rest}");
-                let new_col = indent.len() + 1;
+                let extra = if smart_indent_opens_block(&before_cursor) {
+                    if indent_type == "hard" {
+                        "\t".to_string()
+                    } else {
+                        " ".repeat(indent_size.max(1))
+                    }
+                } else {
+                    String::new()
+                };
+                let new_line = format!("{indent}{extra}{rest}");
+                let new_col = indent.chars().count() + extra.chars().count() + 1;
                 b.lines.insert(line, new_line);
                 line += 1;
                 col = new_col;
@@ -12400,4 +12510,88 @@ fn build_style(_config: &NativeConfig, _ctx: &()) -> StyleContext {
 #[cfg(not(feature = "sdl"))]
 fn load_fonts(_config: &NativeConfig) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(test)]
+mod indent_tests {
+    use super::{smart_backspace_span, smart_indent_opens_block};
+
+    #[test]
+    fn smart_indent_opens_block_python_colon() {
+        assert!(smart_indent_opens_block("for a in sys.argv:"));
+        assert!(smart_indent_opens_block("if x > 0:"));
+        assert!(smart_indent_opens_block("def foo():"));
+    }
+
+    #[test]
+    fn smart_indent_opens_block_braces_brackets() {
+        assert!(smart_indent_opens_block("fn main() {"));
+        assert!(smart_indent_opens_block("let xs = ["));
+        assert!(smart_indent_opens_block("println!("));
+    }
+
+    #[test]
+    fn smart_indent_opens_block_trailing_whitespace() {
+        assert!(smart_indent_opens_block("fn main() {   "));
+    }
+
+    #[test]
+    fn smart_indent_opens_block_ignores_line_comment() {
+        assert!(smart_indent_opens_block("if x: # comment"));
+        assert!(smart_indent_opens_block("fn() { // comment"));
+    }
+
+    #[test]
+    fn smart_indent_opens_block_negatives() {
+        assert!(!smart_indent_opens_block("print(a)"));
+        assert!(!smart_indent_opens_block("let x = 1"));
+        assert!(!smart_indent_opens_block(""));
+        assert!(!smart_indent_opens_block("    "));
+    }
+
+    #[test]
+    fn smart_backspace_full_indent_unit() {
+        // Four spaces then cursor at col 5 -> remove all 4.
+        assert_eq!(smart_backspace_span("    ", 5, "soft", 4), Some(4));
+    }
+
+    #[test]
+    fn smart_backspace_aligns_to_boundary() {
+        // Six spaces, cursor at col 7 -> remove 2 to reach 4-space boundary.
+        assert_eq!(smart_backspace_span("      ", 7, "soft", 4), Some(2));
+    }
+
+    #[test]
+    fn smart_backspace_deeper_indent() {
+        // Eight spaces at col 9 -> remove 4 (one level).
+        assert_eq!(smart_backspace_span("        ", 9, "soft", 4), Some(4));
+    }
+
+    #[test]
+    fn smart_backspace_two_space_doc() {
+        assert_eq!(smart_backspace_span("  ", 3, "soft", 2), Some(2));
+        assert_eq!(smart_backspace_span("    ", 5, "soft", 2), Some(2));
+    }
+
+    #[test]
+    fn smart_backspace_skips_when_text_before() {
+        assert_eq!(smart_backspace_span("    a", 6, "soft", 4), None);
+        assert_eq!(smart_backspace_span("foo", 4, "soft", 4), None);
+    }
+
+    #[test]
+    fn smart_backspace_skips_for_hard_tabs() {
+        assert_eq!(smart_backspace_span("    ", 5, "hard", 4), None);
+    }
+
+    #[test]
+    fn smart_backspace_skips_single_space() {
+        // One space alone should fall through to normal backspace (no jump).
+        assert_eq!(smart_backspace_span(" ", 2, "soft", 4), None);
+    }
+
+    #[test]
+    fn smart_backspace_skips_col_one() {
+        assert_eq!(smart_backspace_span("    ", 1, "soft", 4), None);
+    }
 }

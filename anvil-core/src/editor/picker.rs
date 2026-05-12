@@ -243,39 +243,48 @@ pub fn detect_indent(
     max_lines: usize,
     default_indent: usize,
 ) -> (&'static str, usize, usize) {
-    let mut stats = Vec::new();
+    use std::collections::HashMap;
+    let mut counts: HashMap<usize, usize> = HashMap::new();
+    let mut total_spaces = 0usize;
     let mut tabs = 0usize;
     for text in lines
         .iter()
         .filter(|line| !line.trim().is_empty())
         .take(max_lines)
     {
-        let spaces = text.chars().take_while(|ch| *ch == ' ').count();
-        if spaces > 1 {
-            stats.push(spaces);
-        }
         if text.starts_with('\t') {
             tabs += 1;
+            continue;
+        }
+        let spaces = text.chars().take_while(|ch| *ch == ' ').count();
+        if spaces > 0 {
+            *counts.entry(spaces).or_insert(0) += 1;
+            total_spaces += 1;
         }
     }
-    stats.sort_unstable_by(|a, b| b.cmp(a));
-    let mut best_indent = default_indent;
+    if tabs > total_spaces {
+        return ("hard", default_indent, tabs);
+    }
+    if counts.is_empty() {
+        return ("soft", default_indent, 0);
+    }
+    // Pick the largest candidate width (1..=8) that "explains" the
+    // most observed indents. A candidate explains an entry when the
+    // entry is an exact multiple of the candidate.
+    let mut best_size = default_indent;
     let mut best_score = 0usize;
-    for &indent in &stats {
-        let score = stats
+    for candidate in (1..=8).rev() {
+        let score: usize = counts
             .iter()
-            .filter(|&&candidate| candidate != indent && candidate % indent == 0)
-            .count();
+            .filter(|(width, _)| **width % candidate == 0)
+            .map(|(_, n)| *n)
+            .sum();
         if score > best_score {
-            best_indent = indent;
             best_score = score;
+            best_size = candidate;
         }
     }
-    if tabs > best_score {
-        ("hard", default_indent, tabs)
-    } else {
-        ("soft", best_indent, best_score)
-    }
+    ("soft", best_size, best_score)
 }
 
 /// Check if a file should trigger editor auto-restart on save.
@@ -357,6 +366,45 @@ mod tests {
         assert_eq!(kind, "hard");
         assert_eq!(size, 2);
         assert_eq!(score, 2);
+    }
+
+    #[test]
+    fn indent_detection_uniform_four_spaces() {
+        // testy.py shape: every indented line uses 4 spaces, no deeper nesting.
+        let lines = vec![
+            "import sys\n".into(),
+            "for a in sys.argv:\n".into(),
+            "    print(a)\n".into(),
+            "    print(a)\n".into(),
+        ];
+        let (kind, size, _score) = detect_indent(&lines, 150, 2);
+        assert_eq!(kind, "soft");
+        assert_eq!(size, 4);
+    }
+
+    #[test]
+    fn indent_detection_uniform_two_spaces() {
+        let lines = vec![
+            "function foo()\n".into(),
+            "  return 1\n".into(),
+            "  return 2\n".into(),
+        ];
+        let (kind, size, _score) = detect_indent(&lines, 150, 4);
+        assert_eq!(kind, "soft");
+        assert_eq!(size, 2);
+    }
+
+    #[test]
+    fn indent_detection_nested_four_spaces() {
+        let lines = vec![
+            "def f():\n".into(),
+            "    if x:\n".into(),
+            "        return 1\n".into(),
+            "    return 0\n".into(),
+        ];
+        let (kind, size, _score) = detect_indent(&lines, 150, 2);
+        assert_eq!(kind, "soft");
+        assert_eq!(size, 4);
     }
 
     #[test]
