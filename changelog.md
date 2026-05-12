@@ -1,5 +1,11 @@
 # Change Log
 
+## [2.11.21] - 2026-05-11 -- Python syntax highlighting fix, csproj and fsproj highlighting.
+
+* Fixed: pair-based syntax patterns (Python's `for ... :`, `if ... :`, `def ... :`, etc.) collapsed the entire match into one flat token, leaving inner identifiers, keywords, brackets, and the closing `:` un-highlighted. The tokenizer now matches pair opens, descends into sub-syntaxes for inner content, and pops on the proper close — matching the lite-xl 1.5.5 reference behavior. Captures inside patterns are now split into their typed segments as well (e.g. `# heading {#anchor}` no longer collapses to one keyword run).
+* `.csproj` and `.fsproj` files now open with XML syntax highlighting applied automatically.
+* Fixed: Lua `%f[set]` frontier patterns compiled to a bare lookahead, missing the "previous character not in set" half of the assertion. This caused XML's "text between tags" pattern to fire right after every `<`, swallowing tag names, attributes, and string values as plain text — so `.xml` / `.csproj` / `.fsproj` / `.svg` etc. opened with no visible highlighting beyond the angle brackets. Frontier patterns now emit `(?<![set])(?=[set])` and match lite-xl's Lua semantics.
+
 ## [2.11.20] - 2026-05-11 -- New / Delete / Copy Path from sidebar context menu.
 
 * Right-clicking any file or folder in the sidebar now shows a "New" option. Selecting it opens an inline text input inside the target folder. Controlled with Enter/Esc.

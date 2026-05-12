@@ -468,7 +468,11 @@ impl SidebarWatcher {
             let _ = tx.send(res);
         })
         .ok();
-        Self { watcher, rx: Some(rx), watched_dirs: HashSet::new() }
+        Self {
+            watcher,
+            rx: Some(rx),
+            watched_dirs: HashSet::new(),
+        }
     }
 
     fn watch_dir(&mut self, dir: &str) {
@@ -2154,11 +2158,8 @@ pub fn run(
                                                         sidebar_show_hidden,
                                                     );
                                                 }
-                                                if open_file_into(
-                                                    &full_path,
-                                                    &mut docs,
-                                                    use_git(),
-                                                ) {
+                                                if open_file_into(&full_path, &mut docs, use_git())
+                                                {
                                                     autoreload.watch(&full_path);
                                                     active_tab = docs.len() - 1;
                                                     remember_recent_file(
@@ -2188,36 +2189,31 @@ pub fn run(
                                 sidebar_new_file_cursor = prev;
                             }
                             "backspace" => {}
-                            "delete"
-                                if sidebar_new_file_cursor < sidebar_new_file_name.len() =>
-                            {
-                                let next =
-                                    sidebar_new_file_name[sidebar_new_file_cursor..]
-                                        .char_indices()
-                                        .nth(1)
-                                        .map(|(i, _)| sidebar_new_file_cursor + i)
-                                        .unwrap_or(sidebar_new_file_name.len());
+                            "delete" if sidebar_new_file_cursor < sidebar_new_file_name.len() => {
+                                let next = sidebar_new_file_name[sidebar_new_file_cursor..]
+                                    .char_indices()
+                                    .nth(1)
+                                    .map(|(i, _)| sidebar_new_file_cursor + i)
+                                    .unwrap_or(sidebar_new_file_name.len());
                                 sidebar_new_file_name.drain(sidebar_new_file_cursor..next);
                             }
                             "delete" => {}
                             "left" if sidebar_new_file_cursor > 0 => {
-                                sidebar_new_file_cursor =
-                                    sidebar_new_file_name[..sidebar_new_file_cursor]
-                                        .char_indices()
-                                        .next_back()
-                                        .map(|(i, _)| i)
-                                        .unwrap_or(0);
+                                sidebar_new_file_cursor = sidebar_new_file_name
+                                    [..sidebar_new_file_cursor]
+                                    .char_indices()
+                                    .next_back()
+                                    .map(|(i, _)| i)
+                                    .unwrap_or(0);
                             }
                             "left" => {}
-                            "right"
-                                if sidebar_new_file_cursor < sidebar_new_file_name.len() =>
-                            {
-                                sidebar_new_file_cursor =
-                                    sidebar_new_file_name[sidebar_new_file_cursor..]
-                                        .char_indices()
-                                        .nth(1)
-                                        .map(|(i, _)| sidebar_new_file_cursor + i)
-                                        .unwrap_or(sidebar_new_file_name.len());
+                            "right" if sidebar_new_file_cursor < sidebar_new_file_name.len() => {
+                                sidebar_new_file_cursor = sidebar_new_file_name
+                                    [sidebar_new_file_cursor..]
+                                    .char_indices()
+                                    .nth(1)
+                                    .map(|(i, _)| sidebar_new_file_cursor + i)
+                                    .unwrap_or(sidebar_new_file_name.len());
                             }
                             "right" => {}
                             "home" => {
@@ -3887,7 +3883,9 @@ pub fn run(
                                 redraw = true;
                                 continue;
                             }
-                            "return" | "keypad enter" if mods.ctrl && mods.shift && replace_active => {
+                            "return" | "keypad enter"
+                                if mods.ctrl && mods.shift && replace_active =>
+                            {
                                 if let Some(doc) = docs.get_mut(active_tab) {
                                     let dv = &mut doc.view;
                                     let mut count = 0usize;
@@ -3925,7 +3923,9 @@ pub fn run(
                                 redraw = true;
                                 continue;
                             }
-                            "return" | "keypad enter" if mods.ctrl && !mods.shift && replace_active => {
+                            "return" | "keypad enter"
+                                if mods.ctrl && !mods.shift && replace_active =>
+                            {
                                 if let Some(doc) = docs.get_mut(active_tab) {
                                     let dv = &mut doc.view;
                                     replace_current_match(dv, &find_query, &replace_query);
@@ -4631,9 +4631,7 @@ pub fn run(
                                     let cmd = cmd.clone();
                                     context_menu.hide();
                                     if cmd == "sidebar:new" {
-                                        if let Some((path, is_dir)) =
-                                            sidebar_menu_target.take()
-                                        {
+                                        if let Some((path, is_dir)) = sidebar_menu_target.take() {
                                             let dir = if is_dir {
                                                 path
                                             } else {
@@ -4650,8 +4648,7 @@ pub fn run(
                                             {
                                                 if !sidebar_entries[dir_idx].expanded {
                                                     sidebar_entries[dir_idx].expanded = true;
-                                                    let depth =
-                                                        sidebar_entries[dir_idx].depth;
+                                                    let depth = sidebar_entries[dir_idx].depth;
                                                     let children = scan_directory(
                                                         &dir,
                                                         depth + 1,
@@ -5195,8 +5192,7 @@ pub fn run(
                                 } else {
                                     match std::fs::write(&full_path, "") {
                                         Ok(()) => {
-                                            if subsystems.has_sidebar()
-                                                && !project_root.is_empty()
+                                            if subsystems.has_sidebar() && !project_root.is_empty()
                                             {
                                                 let in_memory_expanded: HashSet<String> =
                                                     sidebar_entries
@@ -5221,11 +5217,7 @@ pub fn run(
                                                     sidebar_show_hidden,
                                                 );
                                             }
-                                            if open_file_into(
-                                                &full_path,
-                                                &mut docs,
-                                                use_git(),
-                                            ) {
+                                            if open_file_into(&full_path, &mut docs, use_git()) {
                                                 autoreload.watch(&full_path);
                                                 active_tab = docs.len() - 1;
                                                 remember_recent_file(
@@ -5376,10 +5368,8 @@ pub fn run(
                                         remove_end += 1;
                                     }
                                     sidebar_watcher.unwatch_dir(&path);
-                                    for entry in sidebar_entries
-                                        .iter()
-                                        .take(remove_end)
-                                        .skip(remove_start)
+                                    for entry in
+                                        sidebar_entries.iter().take(remove_end).skip(remove_start)
                                     {
                                         if entry.is_dir && entry.expanded {
                                             sidebar_watcher.unwatch_dir(&entry.path.clone());
@@ -7492,8 +7482,11 @@ pub fn run(
                     .filter(|e| e.is_dir && e.expanded)
                     .map(|e| e.path.clone())
                     .collect();
-                sidebar_entries =
-                    scan_for_sidebar(subsystems.has_notes_mode(), &project_root, sidebar_show_hidden);
+                sidebar_entries = scan_for_sidebar(
+                    subsystems.has_notes_mode(),
+                    &project_root,
+                    sidebar_show_hidden,
+                );
                 expand_sidebar_from_set(&mut sidebar_entries, &expanded, sidebar_show_hidden);
                 sidebar_watcher.unwatch_all();
                 sidebar_watcher.watch_dir(&project_root);
@@ -7652,36 +7645,19 @@ pub fn run(
                     }
                     // Right side with separators: Lang | UTF-8 | Spaces: N | LF | INS
                     let ext = doc.path.rsplit('.').next().unwrap_or("");
-                    let lang = match ext {
-                        "rs" => "Rust",
-                        "py" => "Python",
-                        "js" => "JavaScript",
-                        "ts" => "TypeScript",
-                        "c" => "C",
-                        "h" => "C",
-                        "cpp" | "cc" => "C++",
-                        "hpp" => "C++",
-                        "go" => "Go",
-                        "toml" => "TOML",
-                        "json" => "JSON",
-                        "yaml" | "yml" => "YAML",
-                        "md" => "Markdown",
-                        "sh" | "bash" => "Shell",
-                        "html" => "HTML",
-                        "css" => "CSS",
-                        "xml" => "XML",
-                        "java" => "Java",
-                        "rb" => "Ruby",
-                        "php" => "PHP",
-                        "sql" => "SQL",
-                        _ => {
-                            if ext.is_empty() {
-                                "Plain Text"
-                            } else {
-                                ext
-                            }
-                        }
-                    };
+                    let filename_for_lang =
+                        doc.path.rsplit('/').next().unwrap_or(doc.path.as_str());
+                    let lang_owned: String =
+                        crate::editor::syntax::match_syntax_entry(filename_for_lang, &syntax_index)
+                            .map(|e| e.name.clone())
+                            .unwrap_or_else(|| {
+                                if ext.is_empty() {
+                                    "Plain Text".to_string()
+                                } else {
+                                    ext.to_string()
+                                }
+                            });
+                    let lang: &str = &lang_owned;
                     let indent_label = if doc.indent_type == "hard" {
                         "Tabs".to_string()
                     } else {
@@ -8443,8 +8419,7 @@ pub fn run(
                             let cursor_safe =
                                 sidebar_new_file_cursor.min(sidebar_new_file_name.len());
                             let before_cursor = &sidebar_new_file_name[..cursor_safe];
-                            let cursor_x =
-                                text_x + draw_ctx.font_width(style.font, before_cursor);
+                            let cursor_x = text_x + draw_ctx.font_width(style.font, before_cursor);
                             draw_ctx.draw_rect(
                                 cursor_x,
                                 text_y_pos,

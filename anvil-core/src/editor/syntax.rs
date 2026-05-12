@@ -10,8 +10,20 @@ pub struct PatternRule {
     pub regex: Option<PatternSpec>,
     /// Token type(s) assigned to matches.
     pub token_type: TokenType,
-    /// Optional sub-syntax reference.
-    pub syntax: Option<String>,
+    /// Optional sub-syntax reference. Either a named selector or an
+    /// inline nested syntax definition (graph-resolved).
+    pub syntax: Option<SubSyntaxSpec>,
+}
+
+/// How a pattern names its sub-syntax. Lite-XL grammars typically inline
+/// the nested syntax via a `{"$ref": "..."}` graph reference; selectors
+/// are reserved for cross-asset lookups.
+#[derive(Debug, Clone)]
+pub enum SubSyntaxSpec {
+    /// Lookup by name in some external registry.
+    Selector(String),
+    /// Fully nested syntax definition, parsed in-place.
+    Inline(Box<SyntaxDefinition>),
 }
 
 /// Pattern specification: single string or open/close pair with optional escape.
@@ -263,8 +275,18 @@ fn parse_pattern_rule(gv: &GraphValue) -> Result<PatternRule, String> {
         rule.token_type = parse_token_type(t);
     }
 
-    if let Some(s) = gv.get("syntax").and_then(|v| v.as_str()) {
-        rule.syntax = Some(s.to_string());
+    if let Some(s) = gv.get("syntax") {
+        match s {
+            GraphValue::Str(name) => {
+                rule.syntax = Some(SubSyntaxSpec::Selector(name.clone()));
+            }
+            GraphValue::Object(_) => {
+                if let Ok(sub_def) = graph_value_to_syntax(s) {
+                    rule.syntax = Some(SubSyntaxSpec::Inline(Box::new(sub_def)));
+                }
+            }
+            _ => {}
+        }
     }
 
     Ok(rule)
@@ -752,9 +774,9 @@ mod tests {
         let compiled = crate::editor::tokenizer::compile_from_definition(&def)
             .expect("compile gossamer syntax");
         let (l1_toks, l1_state) =
-            crate::editor::tokenizer::tokenize_line_with_state(&compiled, "/* hello", None);
+            crate::editor::tokenizer::tokenize_line_with_state(&compiled, "/* hello", &[]);
         assert!(
-            l1_state.is_some(),
+            !l1_state.is_empty(),
             "line 1 should end inside the open block comment"
         );
         // First line tokens should include the `/* hello` body as a comment.
@@ -766,8 +788,8 @@ mod tests {
             "line 1 should emit a comment token, got {l1_toks:?}"
         );
         let (l2_toks, l2_state) =
-            crate::editor::tokenizer::tokenize_line_with_state(&compiled, " world */ x", l1_state);
-        assert!(l2_state.is_none(), "line 2 should close the block comment");
+            crate::editor::tokenizer::tokenize_line_with_state(&compiled, " world */ x", &l1_state);
+        assert!(l2_state.is_empty(), "line 2 should close the block comment");
         let l2_joined: String = l2_toks.iter().map(|t| t.text.as_str()).collect();
         assert_eq!(l2_joined, " world */ x");
         // The leading ` world */` portion should be a single comment run.
@@ -804,6 +826,86 @@ mod tests {
         let entries = load_syntax_index(&data_dir());
         let matched = match_syntax_entry("file.zzzzz_unknown", &entries);
         assert!(matched.is_none());
+    }
+
+    #[test]
+    fn csproj_and_fsproj_match_xml() {
+        let entries = load_syntax_index(&data_dir());
+        for filename in &["foo.csproj", "foo.fsproj", "foo.vbproj", "foo.xaml"] {
+            let matched = match_syntax_entry(filename, &entries);
+            assert!(
+                matched.is_some(),
+                "{filename} should match a syntax entry"
+            );
+            assert_eq!(
+                matched.unwrap().name,
+                "XML",
+                "{filename} should match XML syntax"
+            );
+            let def = matched.unwrap().load_full();
+            assert!(def.is_some(), "XML syntax should load_full for {filename}");
+            let compiled =
+                crate::editor::tokenizer::compile_from_definition(&def.unwrap());
+            assert!(
+                compiled.is_ok(),
+                "XML syntax should compile for {filename}"
+            );
+        }
+    }
+
+    #[test]
+    fn xml_syntax_tokenizes_csproj_content() {
+        let entries = load_syntax_index(&data_dir());
+        let entry = match_syntax_entry("MyApp.csproj", &entries).expect("should match XML");
+        let def = entry.load_full().expect("should load");
+        let compiled =
+            crate::editor::tokenizer::compile_from_definition(&def).expect("should compile");
+        let line = r#"  <PropertyGroup>"#;
+        let toks = crate::editor::tokenizer::tokenize_line(&compiled, line);
+        assert!(!toks.is_empty(), "should produce tokens for XML line");
+        let has_non_normal = toks.iter().any(|t| t.token_type != "normal");
+        assert!(
+            has_non_normal,
+            "XML tokenizer should color at least one token in '{line}', got {toks:?}"
+        );
+    }
+
+    #[test]
+    fn xml_tokenizes_full_csproj_multiline() {
+        // Regression: Lua's `%f[set]` frontier was previously translated
+        // to a bare `(?=[set])` lookahead, which let the XML "text between
+        // tags" pair pattern (`%f[^>][^<]`, type "normal") fire right
+        // after a `<`. The result was that tag names, attributes, and
+        // operators all rendered as plain text in csproj / fsproj /
+        // vbproj / .xml files — i.e. no visible highlighting at all.
+        let entries = load_syntax_index(&data_dir());
+        let entry = match_syntax_entry("MyApp.csproj", &entries).expect("should match XML");
+        let def = entry.load_full().expect("should load");
+        let compiled =
+            crate::editor::tokenizer::compile_from_definition(&def).expect("should compile");
+        let csproj = "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>net8.0</TargetFramework>\n  </PropertyGroup>\n</Project>";
+        let mut state: Vec<u8> = Vec::new();
+        let mut all_types: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for line in csproj.lines() {
+            let (toks, end) =
+                crate::editor::tokenizer::tokenize_line_with_state(&compiled, line, &state);
+            for t in &toks {
+                all_types.insert(t.token_type.clone());
+            }
+            state = end;
+        }
+        // A correctly tokenized csproj produces at least these token
+        // kinds: tag names (`function`), attribute name (`keyword`),
+        // attribute value (`string`), and angle-bracket / equals
+        // delimiters (`operator`). When the frontier pattern is broken
+        // the body collapses to a single `normal` run.
+        for expected in ["function", "keyword", "string", "operator"] {
+            assert!(
+                all_types.contains(expected),
+                "expected token type {expected} not found; got {all_types:?}"
+            );
+        }
     }
 
     #[test]

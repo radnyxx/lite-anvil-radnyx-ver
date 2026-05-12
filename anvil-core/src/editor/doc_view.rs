@@ -965,11 +965,11 @@ pub(crate) fn build_render_lines(
         // tokenizer state that line `first` should start with — needed for
         // block comments / pair-strings that begin above the viewport.
         // Cached states make this O(1) on the happy path (pure scroll).
-        let mut state: Option<usize> = None;
+        let mut state: Vec<u8> = Vec::new();
         if let Some(syntax) = compiled {
             for ln in 1..first.min(b.lines.len() + 1) {
                 let cached = if let Some(cache_cell) = token_cache {
-                    cache_cell.borrow().line_end_states.get(&ln).copied()
+                    cache_cell.borrow().line_end_states.get(&ln).cloned()
                 } else {
                     None
                 };
@@ -977,9 +977,12 @@ pub(crate) fn build_render_lines(
                     end
                 } else {
                     let line_text = b.lines.get(ln - 1).map(|s| s.as_str()).unwrap_or("");
-                    let (_, end) = tokenizer::tokenize_line_with_state(syntax, line_text, state);
+                    let (_, end) = tokenizer::tokenize_line_with_state(syntax, line_text, &state);
                     if let Some(cache_cell) = token_cache {
-                        cache_cell.borrow_mut().line_end_states.insert(ln, end);
+                        cache_cell
+                            .borrow_mut()
+                            .line_end_states
+                            .insert(ln, end.clone());
                     }
                     end
                 };
@@ -1008,22 +1011,22 @@ pub(crate) fn build_render_lines(
                             // Cache hit: advance state from the matching cached
                             // end-state so the next line still sees the right
                             // open-pair carryover.
-                            if let Some(end) = cache.line_end_states.get(&i).copied() {
+                            if let Some(end) = cache.line_end_states.get(&i).cloned() {
                                 state = end;
                             }
                             existing.clone()
                         } else {
                             let (computed, end) =
-                                tokenizer::tokenize_line_with_state(syntax, raw_line, state);
+                                tokenizer::tokenize_line_with_state(syntax, raw_line, &state);
                             let arc = std::sync::Arc::new(computed);
                             cache.lines.insert(i, arc.clone());
-                            cache.line_end_states.insert(i, end);
+                            cache.line_end_states.insert(i, end.clone());
                             state = end;
                             arc
                         }
                     } else {
                         let (computed, end) =
-                            tokenizer::tokenize_line_with_state(syntax, raw_line, state);
+                            tokenizer::tokenize_line_with_state(syntax, raw_line, &state);
                         state = end;
                         std::sync::Arc::new(computed)
                     };
