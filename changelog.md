@@ -1,5 +1,11 @@
 # Change Log
 
+## [2.11.20] - 2026-05-11 -- New / Delete / Copy Path from sidebar context menu.
+
+* Right-clicking any file or folder in the sidebar now shows a "New" option. Selecting it opens an inline text input inside the target folder. Controlled with Enter/Esc.
+* Right-clicking a file in the sidebar now shows a "Delete" option. Confirms before removing the file from disk and closes any open tab pointing at it. Folders do not show the Delete option.
+* Copy path & copy relative path from sidebar context menu,
+
 ## [2.11.19] - 2026-05-11 -- Fix text copy in Nano-Anvil.
 
 * Fixed: selecting text and copying via Ctrl+C or the context menu "Copy" item did not update the clipboard in Nano-Anvil (and context menu copy was similarly broken in Lite-Anvil). Context menu commands (Copy, Cut, Paste, Undo, Redo, etc.) now dispatch through the same code path as keyboard shortcuts.

@@ -1198,6 +1198,10 @@ pub fn run(
         /// trailing `.ext`. Yes proceeds (and still checks for overwrite
         /// next); No returns to the picker so the user can add one.
         NoExtension { save_path: String, doc_tab: usize },
+        /// "Delete FILE?" — sidebar Delete confirmation. Yes removes the
+        /// file from disk and closes any open tab pointing to it; No
+        /// dismisses without touching anything.
+        DeleteFile { path: String },
     }
     impl Nag {
         fn is_unsaved(&self) -> bool {
@@ -1635,6 +1639,12 @@ pub fn run(
     // Path being renamed (source). Read by the CmdViewMode::Rename
     // confirm handler to `fs::rename` the file.
     let mut rename_source: String = String::new();
+    // Folder path for the in-progress inline new-file creation (`None` = inactive).
+    let mut sidebar_new_file_dir: Option<String> = None;
+    // Filename currently being typed into the inline new-file input.
+    let mut sidebar_new_file_name: String = String::new();
+    // Byte-offset cursor position within `sidebar_new_file_name`.
+    let mut sidebar_new_file_cursor: usize = 0;
 
     // LSP completion, hover, and go-to-definition state.
     let mut completion = CompletionState::new();
@@ -2086,6 +2096,140 @@ pub fn run(
                     if hover.visible {
                         hover.hide();
                         redraw = true;
+                    }
+
+                    // Inline new-file input in the sidebar intercepts keys.
+                    if sidebar_new_file_dir.is_some() && matches!(nag, Nag::None) {
+                        match key.as_str() {
+                            "escape" => {
+                                sidebar_new_file_dir = None;
+                                sidebar_new_file_name.clear();
+                                sidebar_new_file_cursor = 0;
+                            }
+                            "return" | "keypad enter" => {
+                                let name = sidebar_new_file_name.trim().to_string();
+                                let dir = sidebar_new_file_dir.take().unwrap_or_default();
+                                sidebar_new_file_name.clear();
+                                sidebar_new_file_cursor = 0;
+                                if !name.is_empty() {
+                                    let full_path = std::path::Path::new(&dir)
+                                        .join(&name)
+                                        .to_string_lossy()
+                                        .to_string();
+                                    if std::path::Path::new(&full_path).exists() {
+                                        info_message = Some((
+                                            format!("File already exists: {name}"),
+                                            Instant::now(),
+                                        ));
+                                    } else {
+                                        match std::fs::write(&full_path, "") {
+                                            Ok(()) => {
+                                                if subsystems.has_sidebar()
+                                                    && !project_root.is_empty()
+                                                {
+                                                    // Snapshot in-memory expanded
+                                                    // dirs so the rescan doesn't
+                                                    // collapse the folder the user
+                                                    // just created into.
+                                                    let in_memory_expanded: HashSet<String> =
+                                                        sidebar_entries
+                                                            .iter()
+                                                            .filter(|e| e.is_dir && e.expanded)
+                                                            .map(|e| e.path.clone())
+                                                            .collect();
+                                                    sidebar_entries = scan_for_sidebar(
+                                                        subsystems.has_notes_mode(),
+                                                        &project_root,
+                                                        sidebar_show_hidden,
+                                                    );
+                                                    restore_expanded_folders(
+                                                        &mut sidebar_entries,
+                                                        userdir_path,
+                                                        sidebar_show_hidden,
+                                                        &project_session_key(&project_root),
+                                                    );
+                                                    expand_sidebar_from_set(
+                                                        &mut sidebar_entries,
+                                                        &in_memory_expanded,
+                                                        sidebar_show_hidden,
+                                                    );
+                                                }
+                                                if open_file_into(
+                                                    &full_path,
+                                                    &mut docs,
+                                                    use_git(),
+                                                ) {
+                                                    autoreload.watch(&full_path);
+                                                    active_tab = docs.len() - 1;
+                                                    remember_recent_file(
+                                                        &mut recent_files,
+                                                        &full_path,
+                                                        userdir_path,
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                info_message = Some((
+                                                    format!("Create failed: {e}"),
+                                                    Instant::now(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            "backspace" if sidebar_new_file_cursor > 0 => {
+                                let prev = sidebar_new_file_name[..sidebar_new_file_cursor]
+                                    .char_indices()
+                                    .next_back()
+                                    .map(|(i, _)| i)
+                                    .unwrap_or(0);
+                                sidebar_new_file_name.drain(prev..sidebar_new_file_cursor);
+                                sidebar_new_file_cursor = prev;
+                            }
+                            "backspace" => {}
+                            "delete"
+                                if sidebar_new_file_cursor < sidebar_new_file_name.len() =>
+                            {
+                                let next =
+                                    sidebar_new_file_name[sidebar_new_file_cursor..]
+                                        .char_indices()
+                                        .nth(1)
+                                        .map(|(i, _)| sidebar_new_file_cursor + i)
+                                        .unwrap_or(sidebar_new_file_name.len());
+                                sidebar_new_file_name.drain(sidebar_new_file_cursor..next);
+                            }
+                            "delete" => {}
+                            "left" if sidebar_new_file_cursor > 0 => {
+                                sidebar_new_file_cursor =
+                                    sidebar_new_file_name[..sidebar_new_file_cursor]
+                                        .char_indices()
+                                        .next_back()
+                                        .map(|(i, _)| i)
+                                        .unwrap_or(0);
+                            }
+                            "left" => {}
+                            "right"
+                                if sidebar_new_file_cursor < sidebar_new_file_name.len() =>
+                            {
+                                sidebar_new_file_cursor =
+                                    sidebar_new_file_name[sidebar_new_file_cursor..]
+                                        .char_indices()
+                                        .nth(1)
+                                        .map(|(i, _)| sidebar_new_file_cursor + i)
+                                        .unwrap_or(sidebar_new_file_name.len());
+                            }
+                            "right" => {}
+                            "home" => {
+                                sidebar_new_file_cursor = 0;
+                            }
+                            "end" => {
+                                sidebar_new_file_cursor = sidebar_new_file_name.len();
+                            }
+                            _ => {}
+                        }
+                        redraw = true;
+                        continue;
                     }
 
                     // Command view (file/folder open) intercepts keys — but
@@ -3254,6 +3398,79 @@ pub fn run(
                         }
                     }
 
+                    // "Delete FILE?" prompt intercepts keys. Yes removes the
+                    // file from disk and any open tab; No dismisses.
+                    if let Nag::DeleteFile { path } = &nag {
+                        let target = path.clone();
+                        eat_next_text_input = true;
+                        match key.as_str() {
+                            "y" | "Y" | "return" | "keypad enter" => {
+                                match std::fs::remove_file(&target) {
+                                    Ok(()) => {
+                                        autoreload.unwatch(&target);
+                                        let mut i = 0;
+                                        while i < docs.len() {
+                                            if docs[i].path == target {
+                                                docs.remove(i);
+                                                if active_tab >= docs.len() && !docs.is_empty() {
+                                                    active_tab = docs.len() - 1;
+                                                } else if docs.is_empty() {
+                                                    active_tab = 0;
+                                                } else if i < active_tab {
+                                                    active_tab = active_tab.saturating_sub(1);
+                                                }
+                                            } else {
+                                                i += 1;
+                                            }
+                                        }
+                                        if subsystems.has_sidebar() && !project_root.is_empty() {
+                                            let in_memory_expanded: HashSet<String> =
+                                                sidebar_entries
+                                                    .iter()
+                                                    .filter(|e| e.is_dir && e.expanded)
+                                                    .map(|e| e.path.clone())
+                                                    .collect();
+                                            sidebar_entries = scan_for_sidebar(
+                                                subsystems.has_notes_mode(),
+                                                &project_root,
+                                                sidebar_show_hidden,
+                                            );
+                                            restore_expanded_folders(
+                                                &mut sidebar_entries,
+                                                userdir_path,
+                                                sidebar_show_hidden,
+                                                &project_session_key(&project_root),
+                                            );
+                                            expand_sidebar_from_set(
+                                                &mut sidebar_entries,
+                                                &in_memory_expanded,
+                                                sidebar_show_hidden,
+                                            );
+                                        }
+                                        info_message =
+                                            Some((format!("Deleted {target}"), Instant::now()));
+                                    }
+                                    Err(e) => {
+                                        info_message =
+                                            Some((format!("Delete failed: {e}"), Instant::now()));
+                                    }
+                                }
+                                nag = Nag::None;
+                                redraw = true;
+                                continue;
+                            }
+                            "n" | "N" | "escape" => {
+                                nag = Nag::None;
+                                redraw = true;
+                                continue;
+                            }
+                            _ => {
+                                redraw = true;
+                                continue;
+                            }
+                        }
+                    }
+
                     // "Overwrite FILE?" prompt intercepts keys. Yes writes
                     // over the existing file; No returns to the Save As
                     // picker so the user can adjust the filename. Escape /N
@@ -4032,6 +4249,13 @@ pub fn run(
                         redraw = true;
                         continue;
                     }
+                    // Route typed characters into the inline new-file input.
+                    if sidebar_new_file_dir.is_some() {
+                        sidebar_new_file_name.insert_str(sidebar_new_file_cursor, text);
+                        sidebar_new_file_cursor += text.len();
+                        redraw = true;
+                        continue;
+                    }
                     if cmdview_active
                         && (subsystems.has_picker()
                             || cmdview_mode == CmdViewMode::SaveAs
@@ -4406,6 +4630,49 @@ pub fn run(
                                 if let Some(ref cmd) = item.command {
                                     let cmd = cmd.clone();
                                     context_menu.hide();
+                                    if cmd == "sidebar:new" {
+                                        if let Some((path, is_dir)) =
+                                            sidebar_menu_target.take()
+                                        {
+                                            let dir = if is_dir {
+                                                path
+                                            } else {
+                                                std::path::Path::new(&path)
+                                                    .parent()
+                                                    .map(|p| p.to_string_lossy().to_string())
+                                                    .unwrap_or_else(|| project_root.clone())
+                                            };
+                                            // Expand the target directory in the sidebar if
+                                            // it isn't already so the inline input is visible.
+                                            if let Some(dir_idx) = sidebar_entries
+                                                .iter()
+                                                .position(|e| e.is_dir && e.path == dir)
+                                            {
+                                                if !sidebar_entries[dir_idx].expanded {
+                                                    sidebar_entries[dir_idx].expanded = true;
+                                                    let depth =
+                                                        sidebar_entries[dir_idx].depth;
+                                                    let children = scan_directory(
+                                                        &dir,
+                                                        depth + 1,
+                                                        sidebar_show_hidden,
+                                                    );
+                                                    for (i, child) in
+                                                        children.into_iter().enumerate()
+                                                    {
+                                                        sidebar_entries
+                                                            .insert(dir_idx + 1 + i, child);
+                                                    }
+                                                    sidebar_watcher.watch_dir(&dir);
+                                                }
+                                            }
+                                            sidebar_new_file_dir = Some(dir);
+                                            sidebar_new_file_name.clear();
+                                            sidebar_new_file_cursor = 0;
+                                        }
+                                        redraw = true;
+                                        continue;
+                                    }
                                     if cmd == "sidebar:rename" {
                                         if let Some((path, _is_dir)) = sidebar_menu_target.take() {
                                             rename_source = path.clone();
@@ -4416,6 +4683,33 @@ pub fn run(
                                             cmdview_label = "Rename:".to_string();
                                             cmdview_suggestions = Vec::new();
                                             cmdview_selected = 0;
+                                        }
+                                        redraw = true;
+                                        continue;
+                                    }
+                                    if cmd == "sidebar:delete" {
+                                        if let Some((path, is_dir)) = sidebar_menu_target.take() {
+                                            if !is_dir {
+                                                nag = Nag::DeleteFile { path };
+                                            }
+                                        }
+                                        redraw = true;
+                                        continue;
+                                    }
+                                    if cmd == "sidebar:copy-path" {
+                                        if let Some((path, _)) = sidebar_menu_target.take() {
+                                            crate::window::set_clipboard_text(&path);
+                                        }
+                                        redraw = true;
+                                        continue;
+                                    }
+                                    if cmd == "sidebar:copy-relative-path" {
+                                        if let Some((path, _)) = sidebar_menu_target.take() {
+                                            let rel = std::path::Path::new(&path)
+                                                .strip_prefix(&project_root)
+                                                .map(|p| p.to_string_lossy().into_owned())
+                                                .unwrap_or_else(|_| path.clone());
+                                            crate::window::set_clipboard_text(&rel);
                                         }
                                         redraw = true;
                                         continue;
@@ -4666,22 +4960,57 @@ pub fn run(
                                 };
                             if click_idx >= 0 && (click_idx as usize) < sidebar_entries.len() {
                                 let entry = &sidebar_entries[click_idx as usize];
-                                // Only offer rename on regular files for now --
-                                // renaming directories is handled by the OS
-                                // recursively but would require more UX care
-                                // (open tab paths, expanded-folder bookkeeping).
+                                sidebar_menu_target = Some((entry.path.clone(), entry.is_dir));
+                                let mut items = vec![MenuItem {
+                                    text: "New".into(),
+                                    info: None,
+                                    command: Some("sidebar:new".into()),
+                                    separator: false,
+                                }];
+                                // Rename / Delete are only offered for files;
+                                // directories would need recursive path-fixup
+                                // across open tabs.
                                 if !entry.is_dir {
-                                    sidebar_menu_target = Some((entry.path.clone(), entry.is_dir));
-                                    let items = vec![MenuItem {
+                                    items.push(MenuItem {
+                                        text: String::new(),
+                                        info: None,
+                                        command: None,
+                                        separator: true,
+                                    });
+                                    items.push(MenuItem {
                                         text: "Rename".into(),
                                         info: None,
                                         command: Some("sidebar:rename".into()),
                                         separator: false,
-                                    }];
-                                    context_menu.show(*x, *y, items);
-                                    redraw = true;
-                                    continue;
+                                    });
+                                    items.push(MenuItem {
+                                        text: "Delete".into(),
+                                        info: None,
+                                        command: Some("sidebar:delete".into()),
+                                        separator: false,
+                                    });
                                 }
+                                items.push(MenuItem {
+                                    text: String::new(),
+                                    info: None,
+                                    command: None,
+                                    separator: true,
+                                });
+                                items.push(MenuItem {
+                                    text: "Copy Path".into(),
+                                    info: None,
+                                    command: Some("sidebar:copy-path".into()),
+                                    separator: false,
+                                });
+                                items.push(MenuItem {
+                                    text: "Copy Relative Path".into(),
+                                    info: None,
+                                    command: Some("sidebar:copy-relative-path".into()),
+                                    separator: false,
+                                });
+                                context_menu.show(*x, *y, items);
+                                redraw = true;
+                                continue;
                             }
                         }
                         let mut items = vec![
@@ -4836,6 +5165,94 @@ pub fn run(
                         sidebar_dragging = true;
                         redraw = true;
                         continue;
+                    }
+
+                    // When the inline new-file input is active, route left clicks:
+                    // clicking into the editor commits the new file; clicking
+                    // anywhere in the sidebar cancels it.
+                    if sidebar_new_file_dir.is_some() && *button == MouseButton::Left {
+                        let snap_w = if subsystems.has_sidebar() && sidebar_visible {
+                            sidebar_width
+                        } else {
+                            0.0
+                        };
+                        if *x >= snap_w {
+                            // Commit: create the file and open it.
+                            let name = sidebar_new_file_name.trim().to_string();
+                            let dir = sidebar_new_file_dir.take().unwrap_or_default();
+                            sidebar_new_file_name.clear();
+                            sidebar_new_file_cursor = 0;
+                            if !name.is_empty() {
+                                let full_path = std::path::Path::new(&dir)
+                                    .join(&name)
+                                    .to_string_lossy()
+                                    .to_string();
+                                if std::path::Path::new(&full_path).exists() {
+                                    info_message = Some((
+                                        format!("File already exists: {name}"),
+                                        Instant::now(),
+                                    ));
+                                } else {
+                                    match std::fs::write(&full_path, "") {
+                                        Ok(()) => {
+                                            if subsystems.has_sidebar()
+                                                && !project_root.is_empty()
+                                            {
+                                                let in_memory_expanded: HashSet<String> =
+                                                    sidebar_entries
+                                                        .iter()
+                                                        .filter(|e| e.is_dir && e.expanded)
+                                                        .map(|e| e.path.clone())
+                                                        .collect();
+                                                sidebar_entries = scan_for_sidebar(
+                                                    subsystems.has_notes_mode(),
+                                                    &project_root,
+                                                    sidebar_show_hidden,
+                                                );
+                                                restore_expanded_folders(
+                                                    &mut sidebar_entries,
+                                                    userdir_path,
+                                                    sidebar_show_hidden,
+                                                    &project_session_key(&project_root),
+                                                );
+                                                expand_sidebar_from_set(
+                                                    &mut sidebar_entries,
+                                                    &in_memory_expanded,
+                                                    sidebar_show_hidden,
+                                                );
+                                            }
+                                            if open_file_into(
+                                                &full_path,
+                                                &mut docs,
+                                                use_git(),
+                                            ) {
+                                                autoreload.watch(&full_path);
+                                                active_tab = docs.len() - 1;
+                                                remember_recent_file(
+                                                    &mut recent_files,
+                                                    &full_path,
+                                                    userdir_path,
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            info_message = Some((
+                                                format!("Create failed: {e}"),
+                                                Instant::now(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            // Fall through so the click still lands in the editor.
+                        } else {
+                            // Cancel and swallow the click.
+                            sidebar_new_file_dir = None;
+                            sidebar_new_file_name.clear();
+                            sidebar_new_file_cursor = 0;
+                            redraw = true;
+                            continue;
+                        }
                     }
 
                     // Sidebar click detection.
@@ -7980,12 +8397,71 @@ pub fn run(
                         }
                         ey += entry_h;
                     }
+                    // Inline new-file input: draws an extra row at the bottom
+                    // of the target directory's children.
+                    if let Some(ref new_dir) = sidebar_new_file_dir {
+                        // Find the display row to insert after (the last entry
+                        // still inside `new_dir`, or right after the dir itself).
+                        let mut insert_disp_row = notes_display.len();
+                        let mut nf_dir_depth = 0usize;
+                        let mut found_dir = false;
+                        for (row, &disp_idx) in notes_display.iter().enumerate() {
+                            let e = &sidebar_entries[disp_idx];
+                            if !found_dir {
+                                if e.is_dir && &e.path == new_dir {
+                                    found_dir = true;
+                                    nf_dir_depth = e.depth;
+                                }
+                            } else if e.depth <= nf_dir_depth {
+                                insert_disp_row = row;
+                                break;
+                            }
+                        }
+                        let nf_indent = (nf_dir_depth + 1) as f64 * style.padding_x * 1.5;
+                        let nf_x = style.padding_x + nf_indent;
+                        let nf_y = toolbar_h + dir_header_h + notes_row_h - sidebar_scroll
+                            + insert_disp_row as f64 * entry_h;
+                        if nf_y + entry_h > sidebar_content_top && nf_y < height {
+                            // Selection-tinted row background.
+                            draw_ctx.draw_rect(
+                                0.0,
+                                nf_y,
+                                sidebar_w,
+                                entry_h,
+                                style.selection.to_array(),
+                            );
+                            // Text and cursor for the filename being typed.
+                            let text_x = nf_x + icon_w + style.padding_x * 0.7;
+                            let text_y_pos = nf_y + (entry_h - style.font_height) / 2.0;
+                            draw_ctx.draw_text(
+                                style.font,
+                                &sidebar_new_file_name,
+                                text_x,
+                                text_y_pos,
+                                style.text.to_array(),
+                            );
+                            let cursor_safe =
+                                sidebar_new_file_cursor.min(sidebar_new_file_name.len());
+                            let before_cursor = &sidebar_new_file_name[..cursor_safe];
+                            let cursor_x =
+                                text_x + draw_ctx.font_width(style.font, before_cursor);
+                            draw_ctx.draw_rect(
+                                cursor_x,
+                                text_y_pos,
+                                style.caret_width,
+                                style.font_height,
+                                style.caret.to_array(),
+                            );
+                        }
+                    }
+
                     // Reset clip to full window for the sidebar edge divider.
                     crate::editor::app_state::clip_init(width, height);
 
                     // Sidebar scrollbar (lite-xl style): proportional thumb
                     // with a minimum size, drawn just inside the right edge.
-                    let total_entries_h = notes_display.len() as f64 * entry_h;
+                    let extra_row = sidebar_new_file_dir.is_some() as usize;
+                    let total_entries_h = (notes_display.len() + extra_row) as f64 * entry_h;
                     let sb_area_y = sidebar_content_top;
                     let sb_area_h = (height - sidebar_content_top).max(0.0);
                     sidebar_content_h = total_entries_h;
@@ -9168,6 +9644,22 @@ pub fn run(
                     draw_ctx.draw_rect(0.0, 0.0, width, bar_h, style.nagbar.to_array());
                     let msg =
                         format!("No extension detected ({save_path}). Save anyway?  [Y]es  [N]o");
+                    draw_ctx.draw_text(
+                        style.font,
+                        &msg,
+                        style.padding_x,
+                        style.padding_y,
+                        style.nagbar_text.to_array(),
+                    );
+                }
+
+                // Draw "delete file?" confirmation bar.
+                if let Nag::DeleteFile { path } = &nag {
+                    crate::editor::app_state::clip_init(width, height);
+                    use crate::editor::view::DrawContext as _;
+                    let bar_h = style.font_height + style.padding_y * 2.0;
+                    draw_ctx.draw_rect(0.0, 0.0, width, bar_h, style.nagbar.to_array());
+                    let msg = format!("Delete {path}?  [Y]es  [N]o");
                     draw_ctx.draw_text(
                         style.font,
                         &msg,
