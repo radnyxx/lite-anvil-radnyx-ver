@@ -160,7 +160,7 @@
 },
   "3": {
   "kind": "array",
-  "values": ["%.asm$", "%.s$", "%.S$", "%.inc$", "%.nasm$"]
+  "values": ["%.asm$", "%.s$", "%.S$", "%.inc$", "%.nasm$", "%.gas$"]
 },
   "4": {
   "kind": "array",

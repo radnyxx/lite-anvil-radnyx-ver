@@ -1,5 +1,10 @@
 # Change Log
 
+## [2.11.24] - 2026-05-12 -- RST, SCSS, JSX, Protobuf, MATLAB, CMake, Bazel, Ninja, Scheme, Racket, Jinja, Jupyter, Diff, SSH config, PEM syntax highlighting.
+
+* Added syntax highlighting for 15 languages: reStructuredText (`.rst`), SCSS/Sass (`.scss`), JSX (`.jsx`), Protocol Buffers (`.proto`), MATLAB (`.m`), CMake (`CMakeLists.txt`, `.cmake`), Bazel/Starlark (`BUILD`, `.bzl`), Ninja (`.ninja`), Scheme (`.scm`), Racket (`.rkt`), Jinja2 (`.j2`, `.jinja2`), Jupyter Notebook (`.ipynb`), Diff/Patch (`.diff`, `.patch`), SSH config (`ssh_config`, `sshd_config`), and PEM/certificate files (`.pem`, `.crt`, `.key`, `.pub`).
+* Added `.gas` extension to assembly highlighting.
+
 ## [2.11.23] - 2026-05-12 -- Home/End and Ctrl+C fixes, double/triple-click selection.
 
 * Fixed: pressing Home, End, or Ctrl+C while the find/replace bar was open silently swallowed the key instead of falling through to the document, so the document caret never moved and selections never copied. The find bar now passes Home/End/Ctrl+C (and any other unhandled keys) through to the normal keymap, so caret movement and clipboard shortcuts keep working with the find bar visible.
