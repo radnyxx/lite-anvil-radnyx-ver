@@ -910,7 +910,14 @@ fn translate_event_native(
         return Some(EditorEvent::TextInput(text));
     }
     if t == SDL_EVENT_MOUSE_BUTTON_DOWN || t == SDL_EVENT_MOUSE_BUTTON_UP {
-        let (btn, x, y) = unsafe { (event.button.button, event.button.x, event.button.y) };
+        let (btn, x, y, clicks) = unsafe {
+            (
+                event.button.button,
+                event.button.x,
+                event.button.y,
+                event.button.clicks,
+            )
+        };
         let button = match btn {
             1 => MB::Left,
             2 => MB::Middle,
@@ -932,7 +939,7 @@ fn translate_event_native(
                 button,
                 x: x as f64 * scale_x,
                 y: y as f64 * scale_y,
-                clicks: 1,
+                clicks: (clicks as u32).max(1),
                 modifiers,
             })
         } else {
@@ -1125,7 +1132,14 @@ fn translate_event(state: &mut SdlState, event: SDL_Event) -> PollResult {
     }
 
     if t == SDL_EVENT_MOUSE_BUTTON_DOWN || t == SDL_EVENT_MOUSE_BUTTON_UP {
-        let (btn, x, y) = unsafe { (event.button.button, event.button.x, event.button.y) };
+        let (btn, x, y, clicks) = unsafe {
+            (
+                event.button.button,
+                event.button.x,
+                event.button.y,
+                event.button.clicks,
+            )
+        };
         let Some(btn_name) = button_name(btn) else {
             return PollResult::Skip;
         };
@@ -1135,7 +1149,7 @@ fn translate_event(state: &mut SdlState, event: SDL_Event) -> PollResult {
                 Str(btn_name),
                 Float(x as f64 * scale_x as f64),
                 Float(y as f64 * scale_y as f64),
-                Int(1),
+                Int((clicks as i64).max(1)),
             ]);
         } else {
             return PollResult::Event(vec![

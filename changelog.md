@@ -1,5 +1,10 @@
 # Change Log
 
+## [2.11.23] - 2026-05-12 -- Home/End and Ctrl+C fixes, double/triple-click selection.
+
+* Fixed: pressing Home, End, or Ctrl+C while the find/replace bar was open silently swallowed the key instead of falling through to the document, so the document caret never moved and selections never copied. The find bar now passes Home/End/Ctrl+C (and any other unhandled keys) through to the normal keymap, so caret movement and clipboard shortcuts keep working with the find bar visible.
+* Double-click now selects the word under the caret and triple-click selects the whole line, matching Lite-XL. The SDL click count was previously hardcoded to 1, so neither selection ever fired — every click was treated as a single-click caret placement.
+
 ## [2.11.22] - 2026-05-12 -- Smart auto-indent, indent detection fix, smart backspace.
 
 * Smart auto-indent on Enter. After a line ending in `:`, `{`, `(`, or `[` (with optional trailing whitespace or line comment), the new line gets one extra indent unit on top of the previous line's leading whitespace — e.g. pressing Enter after `for a in sys.argv:` now lands the caret at the correct column. The indent unit honors the document's detected tab/space style and size.

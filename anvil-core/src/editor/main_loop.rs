@@ -4084,8 +4084,14 @@ pub fn run(
                                 continue;
                             }
                             _ => {
-                                redraw = true;
-                                continue;
+                                // Unhandled keys (Home, End, Ctrl+C / X / V,
+                                // arrow keys, page up/down, etc.) fall through
+                                // to the main keymap dispatch so doc navigation
+                                // and clipboard shortcuts keep working while
+                                // the find bar is visible. Bare letters reach
+                                // the keymap with no binding and become no-ops;
+                                // the paired TextInput event still appends them
+                                // to the find query input below.
                             }
                         }
                     }
@@ -4541,6 +4547,7 @@ pub fn run(
                     button,
                     x,
                     y,
+                    clicks,
                     modifiers,
                     ..
                 } => {
@@ -6023,12 +6030,49 @@ pub fn run(
                                 &mut draw_ctx,
                             );
                             let extending = shift_held || modifiers.shift;
+                            let n_clicks = *clicks;
                             let _ = buffer::with_buffer_mut(buf_id, |b| {
                                 let line = click_line.min(b.lines.len()).max(1);
                                 let max_col =
                                     char_count(b.lines[line - 1].trim_end_matches('\n')) + 1;
                                 let col = click_col.min(max_col);
-                                if extending && b.selections.len() >= 4 {
+                                if n_clicks >= 3 && !extending {
+                                    // Triple-click selects the whole clicked
+                                    // line, matching Lite-XL's
+                                    // `doc:set-cursor-line` binding.
+                                    b.selections = vec![line, 1, line, max_col];
+                                } else if n_clicks == 2 && !extending {
+                                    // Double-click selects the word under the
+                                    // cursor. Word chars are alphanumeric or
+                                    // '_', matching the existing
+                                    // word-movement commands.
+                                    let text = b.lines[line - 1].trim_end_matches('\n');
+                                    let chars: Vec<char> = text.chars().collect();
+                                    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+                                    let idx = (col - 1).min(chars.len());
+                                    if idx < chars.len() && is_word(chars[idx]) {
+                                        let mut start = idx;
+                                        while start > 0 && is_word(chars[start - 1]) {
+                                            start -= 1;
+                                        }
+                                        let mut end = idx;
+                                        while end < chars.len() && is_word(chars[end]) {
+                                            end += 1;
+                                        }
+                                        b.selections = vec![line, start + 1, line, end + 1];
+                                    } else if idx > 0 && is_word(chars[idx - 1]) {
+                                        // Click landed just past the end of a
+                                        // word (e.g. on trailing whitespace);
+                                        // still select that word.
+                                        let mut start = idx - 1;
+                                        while start > 0 && is_word(chars[start - 1]) {
+                                            start -= 1;
+                                        }
+                                        b.selections = vec![line, start + 1, line, idx + 1];
+                                    } else {
+                                        b.selections = vec![line, col, line, col];
+                                    }
+                                } else if extending && b.selections.len() >= 4 {
                                     // Shift+click extends the existing selection: keep the
                                     // anchor (selections[0..2]) and only move the cursor end.
                                     b.selections.truncate(4);
