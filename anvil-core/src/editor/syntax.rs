@@ -917,4 +917,54 @@ mod tests {
         assert!(def.is_some());
         assert_eq!(def.unwrap().name, entry.name);
     }
+
+    #[test]
+    fn makefile_filenames_match() {
+        let entries = load_syntax_index(&data_dir());
+        for filename in &["Makefile", "makefile", "GNUmakefile", "rules.mk", "build.mak"] {
+            let matched = match_syntax_entry(filename, &entries);
+            assert!(
+                matched.is_some(),
+                "{filename} should match a syntax entry"
+            );
+            assert_eq!(
+                matched.unwrap().name,
+                "Makefile",
+                "{filename} should match Makefile syntax"
+            );
+        }
+    }
+
+    #[test]
+    fn makefile_syntax_tokenizes_content() {
+        let entries = load_syntax_index(&data_dir());
+        let entry = match_syntax_entry("Makefile", &entries).expect("Makefile should match");
+        let def = entry.load_full().expect("makefile.json should load");
+        let compiled =
+            crate::editor::tokenizer::compile_from_definition(&def).expect("should compile");
+        let content = "# build targets\nall: main.o\n\tgcc -o app main.o\n\nCC := gcc\nINCLUDE = $(CC) -I./include\n";
+        let mut state: Vec<u8> = Vec::new();
+        let mut all_types: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for line in content.lines() {
+            let (toks, end) =
+                crate::editor::tokenizer::tokenize_line_with_state(&compiled, line, &state);
+            for t in &toks {
+                all_types.insert(t.token_type.clone());
+            }
+            state = end;
+        }
+        assert!(
+            all_types.contains("comment"),
+            "Makefile tokenizer should produce comment tokens; got {all_types:?}"
+        );
+        assert!(
+            all_types.contains("function"),
+            "Makefile tokenizer should produce function tokens for targets; got {all_types:?}"
+        );
+        assert!(
+            all_types.contains("keyword2"),
+            "Makefile tokenizer should produce keyword2 tokens for variable refs; got {all_types:?}"
+        );
+    }
 }

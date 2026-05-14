@@ -1,5 +1,10 @@
 # Change Log
 
+## [2.11.25] - 2026-05-13 -- Makefile syntax highlighting.
+
+* Makefile syntax highlighting now works correctly. `Makefile`, `makefile`, `GNUmakefile`, `*.mk`, and `*.mak` are recognized and highlighted with target names, variable references (`$(VAR)`, `${VAR}`), directives (`define`, `ifdef`, `include`, etc.), comments, and strings.
+* Fixed: the file-pattern `[Mm]akefile$` was treated as a literal string by the pattern matcher, so `Makefile` and `makefile` were never recognized. Replaced with two explicit patterns.
+
 ## [2.11.24] - 2026-05-12 -- RST, SCSS, JSX, Protobuf, MATLAB, CMake, Bazel, Ninja, Scheme, Racket, Jinja, Jupyter, Diff, SSH config, PEM syntax highlighting.
 
 * Added syntax highlighting for 15 languages: reStructuredText (`.rst`), SCSS/Sass (`.scss`), JSX (`.jsx`), Protocol Buffers (`.proto`), MATLAB (`.m`), CMake (`CMakeLists.txt`, `.cmake`), Bazel/Starlark (`BUILD`, `.bzl`), Ninja (`.ninja`), Scheme (`.scm`), Racket (`.rkt`), Jinja2 (`.j2`, `.jinja2`), Jupyter Notebook (`.ipynb`), Diff/Patch (`.diff`, `.patch`), SSH config (`ssh_config`, `sshd_config`), and PEM/certificate files (`.pem`, `.crt`, `.key`, `.pub`).

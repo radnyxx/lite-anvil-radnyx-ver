@@ -88,7 +88,7 @@
 },
   "3": {
   "kind": "array",
-  "values": ["[Mm]akefile$", "%.mk$", "GNUmakefile$", "%.mak$"]
+  "values": ["Makefile$", "makefile$", "%.mk$", "GNUmakefile$", "%.mak$"]
 },
   "4": {
   "kind": "array",
