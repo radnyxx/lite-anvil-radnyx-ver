@@ -4485,17 +4485,11 @@ pub fn run(
                             });
                         }
                         if subsystems.has_lsp() {
-                            // Mark LSP change for debounced didChange (only for LSP-handled files).
-                            if lsp_state.transport_id.is_some() && lsp_state.initialized {
-                                if let Some(doc) = docs.get(active_tab) {
-                                    let ext = doc.path.rsplit('.').next().unwrap_or("");
-                                    if !doc.path.is_empty() && ext_to_lsp_filetype(ext).is_some() {
-                                        lsp_state.last_change = Some(Instant::now());
-                                        lsp_state.pending_change_uri = Some(path_to_uri(&doc.path));
-                                        lsp_state.pending_change_version += 1;
-                                    }
-                                }
-                            }
+                            // Buffer-mutation marking happens generically in
+                            // the per-frame change_id watcher; nothing to do
+                            // here on the typing path beyond completion
+                            // triggers below.
+                            //
                             // Trigger LSP completion after trigger characters.
                             let trigger = text == "." || text == ":" || text == "(";
                             let word_char = text
@@ -4724,6 +4718,32 @@ pub fn run(
                                         redraw = true;
                                         continue;
                                     }
+                                    if cmd == "tab:copy-path" {
+                                        if let Some(target) = tab_menu_target.take() {
+                                            if let Some(d) = docs.get(target) {
+                                                if !d.path.is_empty() {
+                                                    crate::window::set_clipboard_text(&d.path);
+                                                }
+                                            }
+                                        }
+                                        redraw = true;
+                                        continue;
+                                    }
+                                    if cmd == "tab:copy-relative-path" {
+                                        if let Some(target) = tab_menu_target.take() {
+                                            if let Some(d) = docs.get(target) {
+                                                if !d.path.is_empty() {
+                                                    let rel = std::path::Path::new(&d.path)
+                                                        .strip_prefix(&project_root)
+                                                        .map(|p| p.to_string_lossy().into_owned())
+                                                        .unwrap_or_else(|_| d.path.clone());
+                                                    crate::window::set_clipboard_text(&rel);
+                                                }
+                                            }
+                                        }
+                                        redraw = true;
+                                        continue;
+                                    }
                                     if cmd.starts_with("tab:close") {
                                         if let Some(target) = tab_menu_target.take() {
                                             // `indices` is built in reverse so
@@ -4900,6 +4920,32 @@ pub fn run(
                                         text: "Close All".into(),
                                         info: None,
                                         command: Some("tab:close-all".into()),
+                                        separator: false,
+                                    });
+                                }
+                                // Copy-path entries only make sense for an
+                                // on-disk file (the doc has a path). Untitled
+                                // buffers fall through with just the close
+                                // group. The leading item with `separator:
+                                // true` is a divider row, not a label; the
+                                // real entries follow.
+                                if docs.get(i).is_some_and(|d| !d.path.is_empty()) {
+                                    items.push(MenuItem {
+                                        text: String::new(),
+                                        info: None,
+                                        command: None,
+                                        separator: true,
+                                    });
+                                    items.push(MenuItem {
+                                        text: "Copy Path".into(),
+                                        info: None,
+                                        command: Some("tab:copy-path".into()),
+                                        separator: false,
+                                    });
+                                    items.push(MenuItem {
+                                        text: "Copy Relative Path".into(),
+                                        info: None,
+                                        command: Some("tab:copy-relative-path".into()),
                                         separator: false,
                                     });
                                 }
@@ -7233,6 +7279,48 @@ pub fn run(
                     if !poll.running {
                         lsp_state.transport_id = None;
                         lsp_state.initialized = false;
+                    }
+                }
+            }
+        }
+
+        // LSP: detect any buffer mutation on the active doc by watching
+        // `change_id`. The typing path used to flip `last_change` itself,
+        // but every other edit route (paste, undo, redo, format-document,
+        // multi-cursor delete, snippet apply, find-and-replace) bypassed
+        // that flag, so inlay hints went stale until the next keystroke.
+        // Polling the change counter per frame catches all of them in one
+        // place.
+        if subsystems.has_lsp()
+            && lsp_state.transport_id.is_some()
+            && lsp_state.initialized
+        {
+            if let Some(doc) = docs.get(active_tab) {
+                if !doc.path.is_empty() {
+                    let ext = doc.path.rsplit('.').next().unwrap_or("");
+                    let is_lsp_file = ext_to_lsp_filetype(ext)
+                        .map(|ft| ft == lsp_state.filetype)
+                        .unwrap_or(false);
+                    if is_lsp_file {
+                        if let Some(buf_id) = doc.view.buffer_id {
+                            let cur =
+                                buffer::with_buffer(buf_id, |b| Ok(b.change_id)).unwrap_or(0);
+                            let uri = path_to_uri(&doc.path);
+                            let prev =
+                                lsp_state.last_seen_change_id.get(&uri).copied();
+                            match prev {
+                                None => {
+                                    lsp_state.last_seen_change_id.insert(uri, cur);
+                                }
+                                Some(p) if p != cur => {
+                                    lsp_state.last_seen_change_id.insert(uri.clone(), cur);
+                                    lsp_state.last_change = Some(Instant::now());
+                                    lsp_state.pending_change_uri = Some(uri);
+                                    lsp_state.pending_change_version += 1;
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }

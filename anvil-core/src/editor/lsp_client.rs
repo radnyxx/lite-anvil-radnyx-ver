@@ -45,6 +45,11 @@ pub(crate) struct LspState {
     pub inlay_hints_uri: String,
     pub inlay_retry_at: Option<Instant>,
     pub inlay_retry_count: u32,
+    /// Last buffer `change_id` observed per URI. Used to detect any
+    /// buffer mutation (paste, undo, redo, snippet, format, command-driven
+    /// edits, ...) regardless of which command produced it, so the
+    /// debounced didChange + inlayHint re-request fires every time.
+    pub last_seen_change_id: HashMap<String, i64>,
 }
 
 impl LspState {
@@ -65,6 +70,7 @@ impl LspState {
             inlay_hints_uri: String::new(),
             inlay_retry_at: None,
             inlay_retry_count: 0,
+            last_seen_change_id: HashMap::new(),
         }
     }
 

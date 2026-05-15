@@ -510,17 +510,7 @@ match cmd.as_str() {
     }
 }
 "about:version" => {
-    let app = if subsystems.has_notes_mode() {
-        "Note Anvil"
-    } else if subsystems.has_sidebar() {
-        "Lite Anvil"
-    } else {
-        "Nano Anvil"
-    };
-    info_message = Some((
-        format!("{} v{}", app, env!("CARGO_PKG_VERSION")),
-        Instant::now(),
-    ));
+    info_message = Some((env!("CARGO_PKG_VERSION").to_string(), Instant::now()));
 }
 "core:project-replace" => {
     if subsystems.has_find_in_files() {

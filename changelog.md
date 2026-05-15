@@ -1,5 +1,11 @@
 # Change Log
 
+## [2.11.26] - 2026-05-15 -- Inlay refresh on every edit, tab path-copy entries, bare version output.
+
+* Fixed: LSP inlay hints did not refresh after paste, undo, redo, format-document, multi-cursor delete, snippet apply, or find-and-replace — only direct typing rearmed the debounced `didChange`, so every other edit route left stale hints anchored at their pre-edit byte offsets. The active document's `change_id` is now polled once per frame and a mismatch fires the same debounce path that typing used to fire directly, so any buffer mutation re-asks the language server for inlays.
+* Right-clicking an open file's tab now offers "Copy Path" and "Copy Relative Path" entries, mirroring the sidebar's per-file menu. Untitled tabs without an on-disk path don't get the entries.
+* The `about:version` command palette entry now prints just the bare version (e.g. `2.11.26`) instead of `Lite Anvil v2.11.26`.
+
 ## [2.11.25] - 2026-05-13 -- Makefile syntax highlighting.
 
 * Makefile syntax highlighting now works correctly. `Makefile`, `makefile`, `GNUmakefile`, `*.mk`, and `*.mak` are recognized and highlighted with target names, variable references (`$(VAR)`, `${VAR}`), directives (`define`, `ifdef`, `include`, etc.), comments, and strings.
