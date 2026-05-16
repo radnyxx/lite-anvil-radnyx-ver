@@ -245,7 +245,6 @@ pub fn detect_indent(
 ) -> (&'static str, usize, usize) {
     use std::collections::HashMap;
     let mut counts: HashMap<usize, usize> = HashMap::new();
-    let mut total_spaces = 0usize;
     let mut tabs = 0usize;
     for text in lines
         .iter()
@@ -257,32 +256,53 @@ pub fn detect_indent(
             continue;
         }
         let spaces = text.chars().take_while(|ch| *ch == ' ').count();
-        if spaces > 0 {
+        // Single-space leads are almost always accidental (continuations,
+        // stray spaces); only widths >= 2 count as real indentation.
+        if spaces > 1 {
             *counts.entry(spaces).or_insert(0) += 1;
-            total_spaces += 1;
         }
     }
-    if tabs > total_spaces {
-        return ("hard", default_indent, tabs);
-    }
-    if counts.is_empty() {
-        return ("soft", default_indent, 0);
-    }
-    // Pick the largest candidate width (1..=8) that "explains" the
-    // most observed indents. A candidate explains an entry when the
-    // entry is an exact multiple of the candidate.
-    let mut best_size = default_indent;
+    let mut widths: Vec<usize> = counts.keys().copied().collect();
+    widths.sort_by(|a, b| b.cmp(a));
+    // Try each observed width as a candidate, largest first. A candidate's
+    // score is the count of OTHER occurrences whose width is a multiple of
+    // it. A smaller width that occurs more than once (or is the smallest
+    // observed width) and is not a multiple of the candidate vetoes it —
+    // this keeps alignment-style continuations (e.g. 19-space wraps in a
+    // 4-space-indented file) from pulling the winner down to 1.
+    let smallest = widths.last().copied();
+    let mut best_size = 0usize;
     let mut best_score = 0usize;
-    for candidate in (1..=8).rev() {
-        let score: usize = counts
-            .iter()
-            .filter(|(width, _)| **width % candidate == 0)
-            .map(|(_, n)| *n)
-            .sum();
+    for &candidate in &widths {
+        let mut score = 0usize;
+        let mut vetoed = false;
+        for &w in &widths {
+            let c = counts[&w];
+            if w == candidate {
+                score += c.saturating_sub(1);
+            } else if w % candidate == 0 {
+                score += c;
+            } else if candidate > w && (c > 1 || Some(w) == smallest) {
+                vetoed = true;
+                break;
+            }
+        }
+        if vetoed {
+            continue;
+        }
         if score > best_score {
             best_score = score;
             best_size = candidate;
         }
+        if score > 0 {
+            break;
+        }
+    }
+    if tabs > best_score {
+        return ("hard", default_indent, tabs);
+    }
+    if best_score == 0 {
+        return ("soft", default_indent, 0);
     }
     ("soft", best_size, best_score)
 }
@@ -402,6 +422,27 @@ mod tests {
             "        return 1\n".into(),
             "    return 0\n".into(),
         ];
+        let (kind, size, _score) = detect_indent(&lines, 150, 2);
+        assert_eq!(kind, "soft");
+        assert_eq!(size, 4);
+    }
+
+    #[test]
+    fn indent_detection_four_spaces_with_alignment_continuation() {
+        // get_xkcd.py shape: bulk 4-space indents (and 8-space nested), plus a few
+        // 19-space alignment-continuation lines from
+        //   p.add_argument("-n", ...,
+        //                  help="...")
+        // The alignment widths used to drag the winner down to 1.
+        let mut lines: Vec<String> = Vec::new();
+        for _ in 0..33 {
+            lines.push("    body\n".into());
+        }
+        for _ in 0..14 {
+            lines.push("        nested\n".into());
+        }
+        lines.push("                   help=\"x\"\n".into());
+        lines.push("                   metavar=\"y\"\n".into());
         let (kind, size, _score) = detect_indent(&lines, 150, 2);
         assert_eq!(kind, "soft");
         assert_eq!(size, 4);

@@ -1,5 +1,9 @@
 # Change Log
 
+## [2.11.27] - 2026-05-15 -- Indent detection ignores alignment-continuation widths.
+
+* Fixed: a 4-space-indented Python file with continuation-line alignment (e.g. `p.add_argument("-n", ...,\n                   help="...")`) was detected as 1-space indent.
+
 ## [2.11.26] - 2026-05-15 -- Inlay refresh on every edit, tab path-copy entries, bare version output.
 
 * Fixed: LSP inlay hints did not refresh after paste, undo, redo, format-document, multi-cursor delete, snippet apply, or find-and-replace — only direct typing rearmed the debounced `didChange`, so every other edit route left stale hints anchored at their pre-edit byte offsets. The active document's `change_id` is now polled once per frame and a mismatch fires the same debounce path that typing used to fire directly, so any buffer mutation re-asks the language server for inlays.
