@@ -312,6 +312,254 @@ pub fn push_tokens(
 
 // ── Compiled syntax types ────────────────────────────────────────────────────
 
+/// 256-bit bitset indexed by raw byte value. `None` means "any byte" —
+/// the runtime must always attempt the regex match. `Some(set)` means the
+/// regex can only match anchored at a position whose byte is in `set`, so
+/// the inner tokenize loop can skip the (anchored) match entirely whenever
+/// the current byte isn't a member.
+///
+/// The set is a *superset* of the bytes the regex can actually match; any
+/// uncertainty in the analyzer (groups, lookarounds, Unicode-aware classes,
+/// inline flag modifiers, quantifiers on the first element, …) collapses
+/// to `None`. False positives (bytes in the set that the regex can't
+/// actually match) are fine — the runtime just wastes one anchored match.
+/// False negatives (a byte missing from the set that the regex *can*
+/// match) would be a correctness bug, which is why the analyzer is
+/// conservative.
+type FirstByteSet = [u64; 4];
+
+#[inline]
+fn fbs_new() -> FirstByteSet {
+    [0u64; 4]
+}
+
+#[inline]
+fn fbs_set(set: &mut FirstByteSet, b: u8) {
+    set[(b >> 6) as usize] |= 1u64 << (b & 63);
+}
+
+#[inline]
+fn fbs_contains(set: &FirstByteSet, b: u8) -> bool {
+    set[(b >> 6) as usize] & (1u64 << (b & 63)) != 0
+}
+
+/// Conservatively compute the first-byte set of `pattern` (a PCRE2 regex
+/// source string). Returns `None` if the analyzer can't prove a tighter
+/// set than "any byte" — the caller then falls back to always trying the
+/// regex match.
+///
+/// Handled (safe to filter):
+/// - Leading anchors `^`, `\A`, ``, `\B`, `\z`, `\Z` (skip and continue).
+/// - Literal ASCII chars not in the metachar set.
+/// - Literal non-ASCII chars (record their UTF-8 lead byte).
+/// - Escaped punctuation `\.`, `\*`, `\(`, …
+/// - Bracket char classes `[abc]`, `[a-z]`, with `\.`-style escapes inside.
+///
+/// Bails (returns None):
+/// - Empty pattern, lone `.`, lone `\d`/`\w`/`\s` (UCP-aware in our builder).
+/// - Negated classes `[^…]` and negated escapes `\D`, `\W`, `\S`.
+/// - Any kind of group `(...)`, `(?:...)`, `(?=...)`, `(?<=...)`.
+/// - Inline flag modifiers `(?i)`, `(?m)`, …
+/// - Backreferences ``..`\9`.
+/// - Quantifiers `?`, `*`, `{0,…}` on the first element (the rest could be
+///   the first non-zero-width match).
+/// - Anything else the parser doesn't explicitly recognise.
+fn analyze_first_byte_set(pattern: &str) -> Option<FirstByteSet> {
+    let bytes = pattern.as_bytes();
+    // Bail on any top-level alternation: `a|b` could match either branch,
+    // and an empty branch (`a|` / `|a`) makes the regex match zero-width
+    // at every position. Walking the structure to enumerate branch first
+    // bytes is doable but error-prone; refusing top-level `|` is both
+    // simpler and demonstrably safe.
+    if has_top_level_alternation(bytes) {
+        return None;
+    }
+    let mut i = 0;
+    // Skip leading anchors and zero-width assertions.
+    while i < bytes.len() {
+        match bytes[i] {
+            b'^' => i += 1,
+            b'\\' if i + 1 < bytes.len() => match bytes[i + 1] {
+                b'A' | b'b' | b'B' | b'z' | b'Z' => i += 2,
+                _ => break,
+            },
+            _ => break,
+        }
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    // Reject quantifier *immediately after* the first element. The first
+    // element could be zero-width, so the second element could be the
+    // actual first match — too complex to follow safely.
+    let first_element_end = first_element_end(bytes, i)?;
+    if let Some(&q) = bytes.get(first_element_end) {
+        if q == b'?' || q == b'*' || q == b'{' {
+            return None;
+        }
+    }
+    analyze_element(bytes, i)
+}
+
+/// True if the regex source contains a `|` at depth 0 outside any
+/// character class. Used to bail the analyzer: alternation lets the regex
+/// match starting with any branch's first set (including empty), which is
+/// more than the first-element analyzer would catch.
+fn has_top_level_alternation(bytes: &[u8]) -> bool {
+    let mut depth = 0i32;
+    let mut in_class = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if in_class {
+            if c == b']' {
+                in_class = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'[' => in_class = true,
+            b'(' => depth += 1,
+            b')' => depth = (depth - 1).max(0),
+            b'|' if depth == 0 => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Walk one regex element starting at `i`. On uncertainty returns None.
+fn analyze_element(bytes: &[u8], i: usize) -> Option<FirstByteSet> {
+    let c = *bytes.get(i)?;
+    match c {
+        b'.' => None,
+        b'(' => None, // groups — bail
+        b'[' => analyze_char_class(bytes, i),
+        b'\\' => {
+            let esc = *bytes.get(i + 1)?;
+            analyze_escape(esc)
+        }
+        // Metachars that shouldn't appear as the first element on their own.
+        b'$' | b'|' | b'+' | b'?' | b'*' | b'{' | b'}' | b']' | b')' => None,
+        _ => {
+            // Literal byte. For multi-byte UTF-8, this is the lead byte of
+            // a sequence (subsequent bytes will be 0x80+ continuation
+            // bytes, which can't start a UTF-8 codepoint, so they wouldn't
+            // be checked as `i` positions anyway).
+            let mut set = fbs_new();
+            fbs_set(&mut set, c);
+            Some(set)
+        }
+    }
+}
+
+/// Length-in-bytes of the first regex element starting at byte offset `i`.
+/// Used purely to peek at the byte AFTER the first element so we can detect
+/// `?`/`*`/`{` quantifiers. Returns None if structure is unclear.
+fn first_element_end(bytes: &[u8], i: usize) -> Option<usize> {
+    let c = *bytes.get(i)?;
+    match c {
+        b'.' => Some(i + 1),
+        b'\\' if i + 1 < bytes.len() => Some(i + 2),
+        b'[' => {
+            // Scan until matching ']', respecting escapes.
+            let mut j = i + 1;
+            // PCRE2 allows `]` as the first char to be literal.
+            if matches!(bytes.get(j), Some(b'^')) {
+                j += 1;
+            }
+            if matches!(bytes.get(j), Some(b']')) {
+                j += 1;
+            }
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'\\' => j += 2,
+                    b']' => return Some(j + 1),
+                    _ => j += 1,
+                }
+            }
+            None
+        }
+        _ if c == b'(' || c == b')' => None,
+        _ => Some(i + 1),
+    }
+}
+
+fn analyze_escape(esc: u8) -> Option<FirstByteSet> {
+    // Unicode/character-class escapes: too broad in our `ucp(true)` mode.
+    // `\d` matches Arabic-Indic digits and other Unicode digits; `\w`
+    // matches Unicode word chars; `\s` matches Unicode whitespace.
+    if matches!(
+        esc,
+        b'd' | b'D' | b'w' | b'W' | b's' | b'S' | b'h' | b'H' | b'v' | b'V' | b'p' | b'P' | b'X'
+    ) {
+        return None;
+    }
+    // Backreferences: ..\9.
+    if esc.is_ascii_digit() {
+        return None;
+    }
+    // Unknown alphabetic escape: bail.
+    if esc.is_ascii_alphabetic() {
+        return None;
+    }
+    // Punctuation escape — the literal char itself.
+    let mut set = fbs_new();
+    fbs_set(&mut set, esc);
+    Some(set)
+}
+
+fn analyze_char_class(bytes: &[u8], start: usize) -> Option<FirstByteSet> {
+    let mut i = start + 1;
+    if matches!(bytes.get(i), Some(b'^')) {
+        return None; // Negated class — too broad.
+    }
+    let mut set = fbs_new();
+    // PCRE2: a `]` immediately after `[` (or `[^`) is a literal `]`.
+    let mut first_in_class = true;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b']' && !first_in_class {
+            return Some(set);
+        }
+        first_in_class = false;
+        if c == b'\\' {
+            let esc = *bytes.get(i + 1)?;
+            // Reject Unicode-aware classes inside; safest path.
+            if matches!(
+                esc,
+                b'd' | b'D' | b'w' | b'W' | b's' | b'S' | b'h' | b'H' | b'v' | b'V' | b'p' | b'P'
+            ) {
+                return None;
+            }
+            fbs_set(&mut set, esc);
+            i += 2;
+            continue;
+        }
+        // Look for a range `a-z`.
+        if i + 2 < bytes.len() && bytes[i + 1] == b'-' && bytes[i + 2] != b']' {
+            let lo = c;
+            let hi = bytes[i + 2];
+            if lo <= hi {
+                for b in lo..=hi {
+                    fbs_set(&mut set, b);
+                }
+            }
+            i += 3;
+            continue;
+        }
+        fbs_set(&mut set, c);
+        i += 1;
+    }
+    None // Unterminated class — give up.
+}
+
 /// How a single pattern matcher operates.
 #[derive(Clone)]
 pub enum MatcherKind {
@@ -324,6 +572,10 @@ pub enum MatcherKind {
 pub struct MatcherDef {
     pub kind: MatcherKind,
     pub whole_line: bool,
+    /// Conservatively-computed bitset of bytes the matcher's regex could
+    /// match starting with. `None` means "any byte" — fall back to always
+    /// trying the match. See `analyze_first_byte_set` for the contract.
+    pub first_byte_set: Option<FirstByteSet>,
 }
 
 /// A pattern that matches either a single span or an open/close pair.
@@ -357,6 +609,21 @@ pub struct PatternDef {
     pub disabled: bool,
 }
 
+impl PatternDef {
+    /// First-byte set for the matcher's *open* side (the side the tokenizer
+    /// looks for when scanning forward through a line). `None` means the
+    /// analyzer couldn't prove a tight set and the caller must always run
+    /// the regex.
+    #[inline]
+    pub fn open_first_byte_set(&self) -> Option<&FirstByteSet> {
+        let m = match &self.matcher {
+            PatternMatcher::Single(m) => m,
+            PatternMatcher::Pair { open, .. } => open,
+        };
+        m.first_byte_set.as_ref()
+    }
+}
+
 /// A fully compiled syntax: patterns + symbol map.
 #[derive(Clone, Default)]
 pub struct CompiledSyntax {
@@ -368,6 +635,12 @@ pub struct CompiledSyntax {
 pub fn compile_regex(pattern: &str) -> Result<Regex, RegexError> {
     let mut builder = RegexBuilder::new();
     builder.utf(true).ucp(true);
+    // Enable PCRE2's JIT compiler when available. Matching a JIT-compiled
+    // regex is ~2-10x faster than the bytecode interpreter for typical
+    // syntax patterns, and `jit_if_available` silently falls back to the
+    // interpreter on builds without JIT support — so this is a free win
+    // on supported platforms and a no-op everywhere else.
+    builder.jit_if_available(true);
     builder
         .build(pattern)
         .map_err(|e| RegexError::Compile(e.to_string()))
@@ -531,6 +804,11 @@ pub fn make_matcher(kind_name: &str, code: String) -> Result<MatcherDef, RegexEr
     } else {
         lua_pattern_to_regex(&code)
     };
+    // Compute the conservative first-byte set BEFORE moving `regex_code`
+    // into the matcher. If the regex itself fails to compile we fall back
+    // to the LuaPattern variant, which the runtime never matches against
+    // anyway, so the set is irrelevant there.
+    let first_byte_set = analyze_first_byte_set(&regex_code);
     let kind = match compile_regex(&regex_code) {
         Ok(compiled) => MatcherKind::Regex {
             compiled: Arc::new(compiled),
@@ -540,7 +818,11 @@ pub fn make_matcher(kind_name: &str, code: String) -> Result<MatcherDef, RegexEr
             MatcherKind::LuaPattern { code: regex_code }
         }
     };
-    Ok(MatcherDef { kind, whole_line })
+    Ok(MatcherDef {
+        kind,
+        whole_line,
+        first_byte_set,
+    })
 }
 
 /// Run a regex matcher at a character offset and return 1-based character positions.
@@ -859,7 +1141,21 @@ pub fn tokenize_line_with_state(
 
         let current_syntax = syn_state.current_syntax;
         let mut matched = false;
+        // Look up the raw byte at char position `i` once. Used by the
+        // first-byte set fast-skip below — when a pattern's open matcher
+        // declares its possible first-byte set, we can avoid running the
+        // anchored regex match entirely whenever this byte isn't in it.
+        // On a 500-char markdown line with 90 patterns, where most chars
+        // are plain text that doesn't start any pattern, this collapses
+        // ~45k regex calls per line to a few thousand.
+        let current_byte: Option<u8> = ucharpos(line, i)
+            .and_then(|bp| line.as_bytes().get(bp - 1).copied());
         for (n, pattern) in current_syntax.patterns.iter().enumerate() {
+            if let (Some(b), Some(set)) = (current_byte, pattern.open_first_byte_set()) {
+                if !fbs_contains(set, b) {
+                    continue;
+                }
+            }
             let find_results = find_text(line, pattern, i, true, false).unwrap_or_default();
             if find_results.len() < 2 {
                 continue;
@@ -1267,5 +1563,74 @@ mod tests {
                 .starts_with("# \u{00C1}rv\u{00ED}zt\u{0171}r\u{0151}"),
             "heading text should be one keyword run, got {first:?}"
         );
+    }
+
+    /// Brute-force correctness check for `analyze_first_byte_set`: for every
+    /// pattern in every bundled syntax, build a small input that begins
+    /// with each ASCII byte the analyzer excluded from the pattern's
+    /// first-byte set, run the anchored PCRE2 match, and confirm it does
+    /// not match. A regex that *can* match anchored at byte `b` whose set
+    /// excludes `b` would be a false negative — the runtime skip would
+    /// drop a valid match, producing wrong tokens. Runs in milliseconds
+    /// because most rejected bytes get rejected by PCRE2 immediately.
+    #[test]
+    fn first_byte_sets_have_no_false_negatives() {
+        let defs = crate::editor::syntax::load_syntax_assets(&data_dir());
+        let mut checked = 0usize;
+        for def in &defs {
+            let Ok(compiled) = compile_from_definition(def) else {
+                continue;
+            };
+            for pat in &compiled.patterns {
+                check_matcher(&pat.matcher, &def.name, &mut checked);
+            }
+        }
+        assert!(checked > 0, "no patterns scanned — syntax data missing?");
+        eprintln!("first_byte_sets_have_no_false_negatives: checked {checked} matchers");
+    }
+
+    fn check_matcher(
+        m: &PatternMatcher,
+        name: &str,
+        checked: &mut usize,
+    ) {
+        match m {
+            PatternMatcher::Single(md) => check_one(md, name, "single", checked),
+            PatternMatcher::Pair { open, close, .. } => {
+                check_one(open, name, "pair.open", checked);
+                check_one(close, name, "pair.close", checked);
+            }
+        }
+    }
+
+    fn check_one(md: &MatcherDef, syntax_name: &str, slot: &str, checked: &mut usize) {
+        let Some(set) = &md.first_byte_set else {
+            return;
+        };
+        *checked += 1;
+        let MatcherKind::Regex { compiled } = &md.kind else {
+            return;
+        };
+        for b in 1u8..=126 {
+            if fbs_contains(set, b) {
+                continue;
+            }
+            // Build a probe that starts with `b` and supplies likely
+            // padding (punctuation + alnums) so most regex shapes can
+            // satisfy a min-length / capture-group requirement.
+            let mut buf = Vec::with_capacity(33);
+            buf.push(b);
+            buf.extend_from_slice(b"abcDEF012_-.()[]+/*?<>={}|");
+            let mut locs = compiled.capture_locations();
+            if let Ok(Some(_)) = compiled.captures_read_at(&mut locs, &buf, 0) {
+                if let Some((s, _e)) = locs.get(0) {
+                    assert!(
+                        s != 0,
+                        "FALSE NEGATIVE: syntax={syntax_name} {slot} regex matched anchored at byte 0x{b:02x} but analyzer excluded it. buf={:?}",
+                        std::str::from_utf8(&buf).unwrap_or("<invalid utf8>"),
+                    );
+                }
+            }
+        }
     }
 }

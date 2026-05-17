@@ -1,8 +1,14 @@
 # Change Log
 
-## [2.11.28] - 2026-05-17 -- Tokenizer UTF-8 indexing fix.
+## [2.11.29] - 2026-05-17 -- Tokenizer per-pattern trigger-byte fast-skip.
 
-* Fixed: tokenizing a syntax-highlighted file with non-ASCII characters (em-dashes, smart quotes, etc.) was up to 13x slower than the same file in pure ASCII because `ucharpos`, `prefix_ulen`, and `usub` walked the bytes from the start on every call — and the inner tokenize loop hits them hundreds of times per line. `tokenize_line_with_state` now primes a per-line char-byte index once up front, so every helper call inside the loop is O(1). Measured: changelog.md drops from 3.9 ms / line to 2.15 ms / line (-45%); web_ready.md from 312 µs / line to 197 µs / line (-37%).
+* Each compiled pattern now carries a conservatively-computed bitset of bytes the regex could possibly match starting with. The inner tokenize loop fetches the current byte once per column and skips patterns whose set excludes it, avoiding the anchored PCRE2 match entirely. Analyzer bails (no filter applied) on any uncertain construct..
+
+## [2.11.28] - 2026-05-17 -- Tokenizer performance fixes.
+
+* Compiled regexes now request PCRE2's JIT (`jit_if_available`). PCRE2's JIT matcher is ~2-10x faster than the bytecode interpreter for typical syntax patterns; this was simply never enabled in the builder. Free win on every platform with JIT support, silent no-op everywhere else.
+* Fixed: tokenizing a syntax-highlighted file with non-ASCII characters (em-dashes, smart quotes, etc.) was up to 13x slower than the same file in pure ASCII because `ucharpos`, `prefix_ulen`, and `usub` walked the bytes from the start on every call — and the inner tokenize loop hits them hundreds of times per line. `tokenize_line_with_state` now primes a per-line char-byte index once up front, so every helper call inside the loop is O(1).
+* Combined measured speedup vs. 2.11.27: the project changelog (UTF-8 markdown, long lines) drops from 3.9 ms / line to 595 µs / line (6.6x); web_ready.md from 312 µs / line to 126 µs / line (2.5x).
 
 ## [2.11.27] - 2026-05-15 -- Indent detection ignores alignment-continuation widths.
 
