@@ -1,4 +1,5 @@
 use pcre2::bytes::{Regex, RegexBuilder};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -12,8 +13,118 @@ pub struct Token {
     pub text: String,
 }
 
-/// Count UTF-8 characters in a string.
+// ── UTF-8 char↔byte index ───────────────────────────────────────────────
+//
+// `tokenize_line_with_state` invokes `ucharpos`, `prefix_ulen`, and `usub`
+// many times per line — every pattern attempt at every column, plus every
+// match result. The naive implementations walk the bytes from the start on
+// each call (O(line_len) each), so a 500-char UTF-8 markdown line with ~90
+// patterns paid O(line_len² × patterns) just in index conversion. Measured
+// on the project changelog (1200-line markdown, em-dashes throughout):
+// ~3.9 ms / line in release.
+//
+// The fix is a per-line char↔byte index. `tokenize_line_with_state` calls
+// `prime_utf8_line_index` once before its inner loop; every helper call
+// inside the loop reads the matching cache and runs in O(1). External
+// callers of the helpers (none today inside this crate, but the surface
+// is `pub`) keep their legacy walk via the fallback path so the public
+// semantics are unchanged.
+
+thread_local! {
+    static UTF8_LINE_INDEX: RefCell<LineIndex> = const { RefCell::new(LineIndex::EMPTY) };
+}
+
+struct LineIndex {
+    line_ptr: *const u8,
+    line_len: usize,
+    is_ascii: bool,
+    /// `char_to_byte[k]` = byte offset of the k-th character (0-based).
+    /// Final entry equals `line.len()` so the helper can read one past
+    /// the last character without a bounds check. Empty when `is_ascii`.
+    char_to_byte: Vec<usize>,
+    /// `byte_to_char[b]` = char index whose byte range contains byte `b`.
+    /// Length = `line.len() + 1`. Bytes inside a multi-byte sequence map
+    /// to the index of the lead char. `byte_to_char[line.len()]` is the
+    /// total char count. Empty when `is_ascii`.
+    byte_to_char: Vec<usize>,
+}
+
+impl LineIndex {
+    const EMPTY: LineIndex = LineIndex {
+        line_ptr: std::ptr::null(),
+        line_len: 0,
+        is_ascii: true,
+        char_to_byte: Vec::new(),
+        byte_to_char: Vec::new(),
+    };
+}
+
+/// Build (or refresh) the thread-local char↔byte index for `line`. Cheap
+/// no-op when the index already matches this `&str` (by pointer + length).
+pub fn prime_utf8_line_index(line: &str) {
+    UTF8_LINE_INDEX.with(|cell| {
+        let mut idx = cell.borrow_mut();
+        if idx.line_ptr == line.as_ptr() && idx.line_len == line.len() {
+            return;
+        }
+        idx.line_ptr = line.as_ptr();
+        idx.line_len = line.len();
+        idx.is_ascii = line.is_ascii();
+        idx.char_to_byte.clear();
+        idx.byte_to_char.clear();
+        if idx.is_ascii {
+            // ASCII path skips the arrays entirely — byte index equals
+            // char index, no table needed.
+            return;
+        }
+        idx.byte_to_char.resize(line.len() + 1, 0);
+        let mut prev_byte = 0usize;
+        let mut char_count = 0usize;
+        for (char_idx, (byte_off, _)) in line.char_indices().enumerate() {
+            idx.char_to_byte.push(byte_off);
+            // Fill the bytes belonging to the *previous* char (mid-sequence
+            // bytes for multi-byte UTF-8) with that char's index.
+            for b in prev_byte..byte_off {
+                idx.byte_to_char[b] = char_idx.saturating_sub(1);
+            }
+            prev_byte = byte_off;
+            char_count = char_idx + 1;
+        }
+        idx.char_to_byte.push(line.len());
+        for b in prev_byte..line.len() {
+            idx.byte_to_char[b] = char_count.saturating_sub(1);
+        }
+        idx.byte_to_char[line.len()] = char_count;
+    });
+}
+
+fn with_line_index<R>(text: &str, f: impl FnOnce(&LineIndex) -> R) -> Option<R> {
+    UTF8_LINE_INDEX.with(|cell| {
+        let idx = cell.borrow();
+        if idx.line_ptr == text.as_ptr() && idx.line_len == text.len() {
+            Some(f(&idx))
+        } else {
+            None
+        }
+    })
+}
+
+/// Count UTF-8 characters in a string. O(1) for ASCII; O(1) when the
+/// thread-local line index matches; otherwise O(N) via `chars().count()`.
 pub fn char_len(text: &str) -> usize {
+    if text.is_ascii() {
+        return text.len();
+    }
+    if let Some(n) = with_line_index(text, |idx| {
+        if idx.is_ascii {
+            text.len()
+        } else {
+            // `char_to_byte` length is char_count + 1 (final = text.len()).
+            idx.char_to_byte.len().saturating_sub(1)
+        }
+    }) {
+        return n;
+    }
     text.chars().count()
 }
 
@@ -22,6 +133,36 @@ pub fn usub(text: &str, start: usize, end: usize) -> &str {
     if start == 0 || start > end {
         return "";
     }
+    if let Some(s) = with_line_index(text, |idx| {
+        if idx.is_ascii {
+            let s_byte = (start - 1).min(text.len());
+            let e_byte = end.min(text.len());
+            if s_byte >= e_byte {
+                return "";
+            }
+            return &text[s_byte..e_byte];
+        }
+        let max_char = idx.char_to_byte.len().saturating_sub(1);
+        let s_idx = (start - 1).min(max_char);
+        let e_idx = end.min(max_char);
+        let s_byte = idx.char_to_byte[s_idx];
+        let e_byte = idx.char_to_byte[e_idx];
+        if s_byte >= e_byte {
+            return "";
+        }
+        &text[s_byte..e_byte]
+    }) {
+        return s;
+    }
+    if text.is_ascii() {
+        let s_byte = (start - 1).min(text.len());
+        let e_byte = end.min(text.len());
+        if s_byte >= e_byte {
+            return "";
+        }
+        return &text[s_byte..e_byte];
+    }
+    // Legacy walk for un-primed UTF-8 callers.
     let mut start_byte = None;
     let mut end_byte = None;
     for (idx, (byte_idx, _)) in (1usize..).zip(text.char_indices()) {
@@ -43,6 +184,18 @@ pub fn usub(text: &str, start: usize, end: usize) -> &str {
 /// Count UTF-8 characters in the first `byte_count` bytes of `text`.
 pub fn prefix_ulen(text: &str, byte_count: usize) -> usize {
     let clamped = byte_count.min(text.len());
+    if let Some(n) = with_line_index(text, |idx| {
+        if idx.is_ascii {
+            clamped
+        } else {
+            idx.byte_to_char[clamped]
+        }
+    }) {
+        return n;
+    }
+    if text.is_ascii() {
+        return clamped;
+    }
     let mut end = clamped;
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
@@ -54,6 +207,27 @@ pub fn prefix_ulen(text: &str, byte_count: usize) -> usize {
 pub fn ucharpos(text: &str, char_idx: usize) -> Option<usize> {
     if char_idx == 0 {
         return Some(1);
+    }
+    if let Some(r) = with_line_index(text, |idx| {
+        if idx.is_ascii {
+            if char_idx > text.len() {
+                return None;
+            }
+            return Some(char_idx);
+        }
+        let max_char = idx.char_to_byte.len().saturating_sub(1);
+        if char_idx > max_char {
+            return None;
+        }
+        Some(idx.char_to_byte[char_idx - 1] + 1)
+    }) {
+        return r;
+    }
+    if text.is_ascii() {
+        if char_idx > text.len() {
+            return None;
+        }
+        return Some(char_idx);
     }
     let mut count = 0usize;
     for (byte_idx, _) in text.char_indices() {
@@ -564,6 +738,10 @@ pub fn tokenize_line_with_state(
     line: &str,
     in_state: &[u8],
 ) -> (Vec<Token>, Vec<u8>) {
+    // Build the per-line char↔byte index once so every `ucharpos`,
+    // `prefix_ulen`, and `usub` call inside this function runs in O(1).
+    // See the `LineIndex` comment above for the why.
+    prime_utf8_line_index(line);
     let mut tokens = Vec::new();
     let line_len = char_len(line);
 

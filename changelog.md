@@ -1,5 +1,9 @@
 # Change Log
 
+## [2.11.28] - 2026-05-17 -- Tokenizer UTF-8 indexing fix.
+
+* Fixed: tokenizing a syntax-highlighted file with non-ASCII characters (em-dashes, smart quotes, etc.) was up to 13x slower than the same file in pure ASCII because `ucharpos`, `prefix_ulen`, and `usub` walked the bytes from the start on every call — and the inner tokenize loop hits them hundreds of times per line. `tokenize_line_with_state` now primes a per-line char-byte index once up front, so every helper call inside the loop is O(1). Measured: changelog.md drops from 3.9 ms / line to 2.15 ms / line (-45%); web_ready.md from 312 µs / line to 197 µs / line (-37%).
+
 ## [2.11.27] - 2026-05-15 -- Indent detection ignores alignment-continuation widths.
 
 * Fixed: a 4-space-indented Python file with continuation-line alignment (e.g. `p.add_argument("-n", ...,\n                   help="...")`) was detected as 1-space indent.
