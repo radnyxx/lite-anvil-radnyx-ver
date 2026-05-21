@@ -1,5 +1,9 @@
 # Change Log
 
+## [2.11.30] - 2026-05-21 -- Shift+Enter inserts a newline.
+
+* Shift+Enter was unbound and did nothing. It now mirrors plain Enter (submit / newline / dialog select), matching the behavior of most editors where the shift modifier on Return is transparent.
+
 ## [2.11.29] - 2026-05-17 -- Tokenizer per-pattern trigger-byte fast-skip.
 
 * Each compiled pattern now carries a conservatively-computed bitset of bytes the regex could possibly match starting with. The inner tokenize loop fetches the current byte once per column and skips patterns whose set excludes it, avoiding the anchored PCRE2 match entirely. Analyzer bails (no filter applied) on any uncertain construct..

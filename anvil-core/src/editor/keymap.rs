@@ -221,6 +221,15 @@ const DEFAULT_BINDINGS: &[(&str, &[&str])] = &[
             "dialog:select",
         ],
     ),
+    (
+        "shift+return",
+        &[
+            "command:submit",
+            "context-menu:submit",
+            "doc:newline",
+            "dialog:select",
+        ],
+    ),
     ("ctrl+return", &["doc:newline-below"]),
     ("ctrl+shift+return", &["doc:newline-above"]),
     ("ctrl+j", &["doc:join-lines"]),
@@ -502,6 +511,19 @@ mod tests {
         };
         let cmds = km.on_key_pressed("r", mods).expect("ctrl+shift+r unbound");
         assert!(cmds.iter().any(|c| c == "core:open-recent"));
+    }
+
+    #[test]
+    fn shift_return_mirrors_plain_return() {
+        let mut km = NativeKeymap::with_defaults();
+        let mods = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let cmds = km
+            .on_key_pressed("return", mods)
+            .expect("shift+return unbound");
+        assert!(cmds.iter().any(|c| c == "doc:newline"));
     }
 
     #[test]
