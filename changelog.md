@@ -1,5 +1,9 @@
 # Change Log
 
+## [2.11.31] - 2026-05-22 -- Autosave no longer triggers spurious "file changed on disk" prompts.
+
+* Fixed: NoteAnvil's autosave writes echoed back through the directory watcher and were misread as external edits, so resuming typing right after an autosave raised a false "File changed on disk, reload?" prompt.
+
 ## [2.11.30] - 2026-05-21 -- Shift+Enter inserts a newline.
 
 * Shift+Enter was unbound and did nothing. It now mirrors plain Enter (submit / newline / dialog select), matching the behavior of most editors where the shift modifier on Return is transparent.

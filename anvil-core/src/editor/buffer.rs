@@ -1537,6 +1537,43 @@ mod tests {
         let _ = fs::remove_file(&out);
     }
 
+    #[test]
+    fn save_then_reload_preserves_content_signature() {
+        // Autoreload suppresses its own write echoes by comparing the
+        // signature of the reloaded disk content against the signature
+        // recorded at save time (`saved_signature`). That only works if a
+        // save -> reload round trip reproduces the same signature, so lock
+        // that invariant in across trailing whitespace, CRLF, and BOM.
+        for (name, lines, crlf, bom) in [
+            ("plain", vec!["alpha\n".to_string(), "beta\n".to_string()], false, BomType::None),
+            (
+                "trailing_ws",
+                vec!["code   \n".to_string(), "more\t\n".to_string()],
+                false,
+                BomType::None,
+            ),
+            ("crlf", vec!["one\n".to_string(), "two\n".to_string()], true, BomType::None),
+            ("bom", vec!["x\n".to_string(), "y\n".to_string()], false, BomType::Utf8),
+        ] {
+            let mut state = default_buffer_state();
+            state.lines = lines;
+            state.bom = bom;
+            let saved_signature = content_signature(&state.lines);
+
+            let path = std::env::temp_dir().join(format!("liteanvil_sig_rt_{name}.txt"));
+            save_file(&state, path.to_str().unwrap(), crlf, false).unwrap();
+
+            let mut reloaded = default_buffer_state();
+            load_file(&mut reloaded, path.to_str().unwrap()).unwrap();
+            assert_eq!(
+                content_signature(&reloaded.lines),
+                saved_signature,
+                "{name}: reloaded disk signature must match saved_signature"
+            );
+            let _ = fs::remove_file(&path);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn inplace_save_preserves_executable_bit() {

@@ -7559,48 +7559,63 @@ pub fn run(
                     let doc_canon = std::fs::canonicalize(&doc.path)
                         .map(|p| p.to_string_lossy().to_string())
                         .unwrap_or_else(|_| doc.path.clone());
-                    if doc_canon == canonical {
-                        if doc_is_modified(doc) {
-                            nag = Nag::ReloadFromDisk {
-                                path: doc.path.clone(),
-                            };
-                        } else if let Some(buf_id) = doc.view.buffer_id {
-                            let path = doc.path.clone();
-                            let _ = buffer::with_buffer_mut(buf_id, |b| {
-                                let mut buf_state = buffer::default_buffer_state();
-                                if buffer::load_file(&mut buf_state, &path).is_ok() {
-                                    b.lines = buf_state.lines;
-                                    // `default_buffer_state()` resets
-                                    // change_id to 1; copying it back
-                                    // means a just-opened buffer (also
-                                    // at change_id 1) sees no change
-                                    // and the doc-view render cache
-                                    // hits on the stale lines.  Bump
-                                    // past the current value so every
-                                    // downstream cache invalidates.
-                                    b.change_id = b.change_id.wrapping_add(1).max(1);
-                                }
-                                Ok(())
-                            });
-                            // Force the render cache to rebuild on the
-                            // next frame rather than waiting for the
-                            // change_id comparison to catch the bump
-                            // (cheap, and removes any reliance on it).
-                            doc.cached_change_id = -1;
-                            doc.cached_render = std::sync::Arc::new(Vec::new());
-                            // Keep the "saved" markers aligned with
-                            // what we just wrote so the next external
-                            // change doesn't misfire the Reload prompt.
-                            if let Ok((cid, sig)) = buffer::with_buffer(buf_id, |b| {
-                                Ok((b.change_id, buffer::content_signature(&b.lines)))
-                            }) {
-                                doc.saved_change_id = cid;
-                                doc.saved_signature = sig;
-                            }
-                        }
-                        redraw = true;
+                    if doc_canon != canonical {
+                        continue;
+                    }
+                    let Some(buf_id) = doc.view.buffer_id else {
+                        break;
+                    };
+                    let path = doc.path.clone();
+                    // We watch the parent directory, so our own writes --
+                    // notably notes-mode autosave -- echo back as change
+                    // events too. A watcher event is only a hint to check;
+                    // the authoritative test is whether the bytes on disk
+                    // differ from what we last persisted. Read the file and
+                    // compare its signature against the one recorded at our
+                    // last save: if they match, this is the echo of our own
+                    // write, so there is nothing to reload or warn about.
+                    let mut disk_state = buffer::default_buffer_state();
+                    if buffer::load_file(&mut disk_state, &path).is_err() {
                         break;
                     }
+                    let disk_sig = buffer::content_signature(&disk_state.lines);
+                    if disk_sig == doc.saved_signature {
+                        break;
+                    }
+                    // The bytes on disk genuinely differ from our last save.
+                    if doc_is_modified(doc) {
+                        // Local edits would be lost by an automatic reload.
+                        nag = Nag::ReloadFromDisk { path };
+                    } else {
+                        // No local edits: adopt the external content. We
+                        // already loaded it above, so move it straight in.
+                        let _ = buffer::with_buffer_mut(buf_id, |b| {
+                            b.lines = disk_state.lines;
+                            // `default_buffer_state()` resets change_id to 1;
+                            // a just-opened buffer also sits at 1, so the
+                            // doc-view render cache would hit on stale lines.
+                            // Bump past the current value to invalidate every
+                            // downstream cache.
+                            b.change_id = b.change_id.wrapping_add(1).max(1);
+                            Ok(())
+                        });
+                        // Force the render cache to rebuild next frame rather
+                        // than relying on the change_id comparison to catch
+                        // the bump.
+                        doc.cached_change_id = -1;
+                        doc.cached_render = std::sync::Arc::new(Vec::new());
+                        // Realign the "saved" markers with what is now on
+                        // disk so the next external change is judged against
+                        // the correct baseline.
+                        if let Ok((cid, sig)) = buffer::with_buffer(buf_id, |b| {
+                            Ok((b.change_id, buffer::content_signature(&b.lines)))
+                        }) {
+                            doc.saved_change_id = cid;
+                            doc.saved_signature = sig;
+                        }
+                    }
+                    redraw = true;
+                    break;
                 }
             }
 
