@@ -1293,6 +1293,40 @@ pub fn regex_find_in_line(
     Some((s + 1, e + 1))
 }
 
+/// Regex find across the whole document, newlines included. Returns 1-based
+/// (start_line, start_col, end_line, end_col) tuples. A match that consumes a
+/// line's trailing `\n` ends at column 1 of the following line, so deleting
+/// the matched range removes the line break too.
+pub fn regex_find_all(
+    lines: &[String],
+    re: &crate::editor::regex::NativeRegex,
+) -> Vec<(usize, usize, usize, usize)> {
+    let text: String = lines.concat();
+    let mut line_starts = Vec::with_capacity(lines.len());
+    let mut acc = 0usize;
+    for l in lines {
+        line_starts.push(acc);
+        acc += l.len();
+    }
+    let to_pos = |offset: usize| {
+        let i = line_starts.partition_point(|&s| s <= offset) - 1;
+        let col = text[line_starts[i]..offset].chars().count() + 1;
+        (i + 1, col)
+    };
+    let mut out = Vec::new();
+    for m in re.find_iter(text.as_bytes(), 0) {
+        let Ok(m) = m else { break };
+        let (s, e) = m.span();
+        if e <= s {
+            continue;
+        }
+        let (sl, sc) = to_pos(s);
+        let (el, ec) = to_pos(e);
+        out.push((sl, sc, el, ec));
+    }
+    out
+}
+
 /// Plain text replacement. Returns (result, replacement_count).
 pub fn replace_plain(text: &str, old: &str, new: &str) -> (String, usize) {
     let mut out = String::with_capacity(text.len());
@@ -1354,6 +1388,71 @@ pub enum BufferError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn find_regex(pattern: &str) -> crate::editor::regex::NativeRegex {
+        let flags = crate::editor::regex::CompileFlags {
+            multiline: true,
+            ..Default::default()
+        };
+        crate::editor::regex::NativeRegex::compile(pattern, flags).unwrap()
+    }
+
+    #[test]
+    fn regex_find_all_maps_single_line_match() {
+        let lines = vec!["one\n".to_string(), "two three\n".to_string()];
+        let re = find_regex("three");
+        assert_eq!(regex_find_all(&lines, &re), vec![(2, 5, 2, 10)]);
+    }
+
+    #[test]
+    fn regex_find_all_match_with_newline_ends_on_next_line() {
+        let lines = vec![
+            "one\n".to_string(),
+            "example-wow.com\n".to_string(),
+            "two\n".to_string(),
+        ];
+        let re = find_regex(r".*-.*\n");
+        assert_eq!(regex_find_all(&lines, &re), vec![(2, 1, 3, 1)]);
+    }
+
+    #[test]
+    fn regex_find_all_match_spanning_two_lines() {
+        let lines = vec!["foo\n".to_string(), "bar\n".to_string()];
+        let re = find_regex(r"foo\nbar");
+        assert_eq!(regex_find_all(&lines, &re), vec![(1, 1, 2, 4)]);
+    }
+
+    #[test]
+    fn regex_find_all_line_anchors_match_per_line() {
+        let lines = vec!["abc\n".to_string(), "abc\n".to_string()];
+        let re = find_regex("^abc$");
+        assert_eq!(
+            regex_find_all(&lines, &re),
+            vec![(1, 1, 1, 4), (2, 1, 2, 4)]
+        );
+    }
+
+    #[test]
+    fn regex_find_all_multibyte_columns_are_char_based() {
+        let lines = vec!["héllo wörld\n".to_string()];
+        let re = find_regex("wörld");
+        assert_eq!(regex_find_all(&lines, &re), vec![(1, 7, 1, 12)]);
+    }
+
+    #[test]
+    fn deleting_newline_inclusive_match_removes_whole_line() {
+        let mut state = default_buffer_state();
+        state.lines = vec![
+            "one\n".to_string(),
+            "example-wow.com\n".to_string(),
+            "two\n".to_string(),
+        ];
+        let re = find_regex(r".*-.*\n");
+        let (sl, sc, el, ec) = regex_find_all(&state.lines, &re)[0];
+        state.selections = vec![sl, sc, el, ec];
+        delete_selection(&mut state);
+        assert_eq!(state.lines, vec!["one\n".to_string(), "two\n".to_string()]);
+    }
 
     #[test]
     fn content_signature_empty_vs_nonempty() {

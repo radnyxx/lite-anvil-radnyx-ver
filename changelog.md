@@ -1,5 +1,9 @@
 # Change Log
 
+## [2.11.33] - 2026-06-09 -- Find/Replace regex can match newlines.
+
+* Fixed: the find bar searched each line separately with its trailing newline stripped, so `\n` in a regex could never match -- replacing `.*-.*\n` with nothing left an empty line behind instead of removing the line. Find now searches the whole document as one subject, so patterns can include `\n` and even span multiple lines; a match that consumes a line's newline ends at column 1 of the next line, and replacing it deletes the line break too. `^` and `$` keep their per-line meaning.
+
 ## [2.11.32] - 2026-06-09 -- Non-Latin text no longer renders as squares.
 
 * Fixed: characters outside the bundled Lilex fonts' coverage (Chinese, Japanese, Korean, Thai, Arabic, Hebrew, Indic scripts, ...) drew as .notdef boxes in file content, tab titles, paths, and the status bar. Font-group fallback now detects unmapped codepoints (the old check accepted the .notdef box as a real glyph, so configured `paths` fallbacks never fired), and codepoints missing from every configured font lazily fall back to installed system fonts: YaHei, JhengHei, Yu Gothic, Malgun, Segoe UI, Leelawadee UI, Nirmala UI, Ebrima on Windows; PingFang, Hiragino, Apple SD Gothic Neo, Thonburi, Geeza Pro, Khmer/Lao MN, Devanagari/Tamil Sangam MN, Kefa, Arial Unicode on macOS; the Noto CJK collections plus every installed per-script Noto face, WenQuanYi, and DejaVu on Linux. Fallback fonts load one at a time on first miss, so sessions without non-Latin text pay nothing. Text width measurement uses the same group-and-fallback advances as drawing, so carets and selections stay aligned over fallback glyphs.

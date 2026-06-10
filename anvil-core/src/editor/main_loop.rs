@@ -1154,7 +1154,7 @@ pub fn run(
     let mut find_whole_word = false;
     let mut find_case_insensitive = false;
     // All current matches as (line, col, end_col) with 1-based columns.
-    let mut find_matches: Vec<(usize, usize, usize)> = Vec::new();
+    let mut find_matches: Vec<(usize, usize, usize, usize)> = Vec::new();
     let mut find_current: Option<usize> = None;
     // Anchor (line, col) captured when find is opened — live-search re-centers here
     // so typing a longer query doesn't skip past matches the user hasn't seen yet.
@@ -11079,48 +11079,33 @@ fn build_find_regex(
     if whole_word {
         pat = format!(r"\b(?:{pat})\b");
     }
+    // The whole document is searched as one subject, so `multiline` keeps
+    // `^`/`$` anchored to line boundaries rather than the document ends.
     let flags = crate::editor::regex::CompileFlags {
         caseless: case_insensitive,
+        multiline: true,
         ..Default::default()
     };
     crate::editor::regex::NativeRegex::compile(&pat, flags).ok()
 }
 
-/// Scan the document and return every match as (line, col, end_col). All values
-/// are 1-based. Multi-line matches are not supported — each line is searched
-/// independently, matching the single-line cursor model.
+/// Scan the document and return every match as (line, col, end_line, end_col).
+/// All values are 1-based. Matches may span newlines; a match consuming a
+/// line's trailing `\n` ends at column 1 of the next line.
 fn compute_find_matches(
     dv: &DocView,
     query: &str,
     use_regex: bool,
     whole_word: bool,
     case_insensitive: bool,
-) -> Vec<(usize, usize, usize)> {
-    let mut out = Vec::new();
+) -> Vec<(usize, usize, usize, usize)> {
     let Some(re) = build_find_regex(query, use_regex, whole_word, case_insensitive) else {
-        return out;
+        return Vec::new();
     };
     let Some(buf_id) = dv.buffer_id else {
-        return out;
+        return Vec::new();
     };
-    let _ = buffer::with_buffer(buf_id, |b| {
-        for (i, raw) in b.lines.iter().enumerate() {
-            let line = raw.trim_end_matches('\n');
-            let bytes = line.as_bytes();
-            for m in re.find_iter(bytes, 0) {
-                let Ok(m) = m else { break };
-                let (s, e) = m.span();
-                if e <= s {
-                    continue;
-                }
-                let col = line[..s].chars().count() + 1;
-                let end_col = col + line[s..e].chars().count();
-                out.push((i + 1, col, end_col));
-            }
-        }
-        Ok(())
-    });
-    out
+    buffer::with_buffer(buf_id, |b| Ok(buffer::regex_find_all(&b.lines, &re))).unwrap_or_default()
 }
 
 /// Like `compute_find_matches` but optionally restricts results to the lines
@@ -11133,23 +11118,14 @@ fn compute_find_matches_filtered(
     whole_word: bool,
     case_insensitive: bool,
     selection: Option<(usize, usize, usize, usize)>,
-) -> Vec<(usize, usize, usize)> {
+) -> Vec<(usize, usize, usize, usize)> {
     let all = compute_find_matches(dv, query, use_regex, whole_word, case_insensitive);
     let Some((sl, sc, el, ec)) = selection else {
         return all;
     };
     all.into_iter()
-        .filter(|&(line, col, end_col)| {
-            if line < sl || line > el {
-                return false;
-            }
-            if line == sl && col < sc {
-                return false;
-            }
-            if line == el && end_col > ec {
-                return false;
-            }
-            true
+        .filter(|&(line, col, end_line, end_col)| {
+            (line, col) >= (sl, sc) && (end_line, end_col) <= (el, ec)
         })
         .collect()
 }
@@ -11157,7 +11133,7 @@ fn compute_find_matches_filtered(
 /// Index of the first match at or after (line, col). Wraps to 0 if nothing
 /// later exists. Returns None only for an empty match list.
 fn find_match_at_or_after(
-    matches: &[(usize, usize, usize)],
+    matches: &[(usize, usize, usize, usize)],
     line: usize,
     col: usize,
 ) -> Option<usize> {
@@ -11174,7 +11150,11 @@ fn find_match_at_or_after(
 
 /// Index of the last match strictly before (line, col). Wraps to the final
 /// match if nothing earlier exists. Returns None only for an empty match list.
-fn find_match_before(matches: &[(usize, usize, usize)], line: usize, col: usize) -> Option<usize> {
+fn find_match_before(
+    matches: &[(usize, usize, usize, usize)],
+    line: usize,
+    col: usize,
+) -> Option<usize> {
     if matches.is_empty() {
         return None;
     }
@@ -11190,11 +11170,11 @@ fn find_match_before(matches: &[(usize, usize, usize)], line: usize, col: usize)
 }
 
 /// Move the caret to the given match and scroll the view so it is visible.
-fn select_find_match(dv: &mut DocView, m: (usize, usize, usize), replace_active: bool) {
-    let (line, col, end_col) = m;
+fn select_find_match(dv: &mut DocView, m: (usize, usize, usize, usize), replace_active: bool) {
+    let (line, col, end_line, end_col) = m;
     let Some(buf_id) = dv.buffer_id else { return };
     let _ = buffer::with_buffer_mut(buf_id, |b| {
-        b.selections = vec![line, col, line, end_col];
+        b.selections = vec![line, col, end_line, end_col];
         Ok(())
     });
     // Use the real line height from the current style, not a hardcoded
