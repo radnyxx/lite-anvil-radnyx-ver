@@ -1,3 +1,4 @@
+use super::fallback;
 use super::font::{FontRef, GlyphInfo, is_whitespace};
 use sdl3_sys::everything::*;
 
@@ -189,7 +190,7 @@ impl RenCache {
         color: RenColor,
         tab_offset: f32,
     ) -> f32 {
-        let width = fonts[0].lock().text_width(&text, tab_offset);
+        let width = group_text_width(&fonts, &text, tab_offset);
         let height = fonts[0].lock().height;
         let bounding = RenRect {
             x: x as i32,
@@ -643,27 +644,71 @@ fn blend_text(fc: u32, src: u32, fa: u32, dst: u32) -> u32 {
     (fc * src * fa + dst * (65025 - src * fa) + 32767) / 65025
 }
 
-/// Find the glyph for `codepoint` using the font group (first font with glyph wins).
-/// Returns the GlyphInfo clone and the font's height.
+/// True when the font actually maps the codepoint and produced a drawable glyph.
+fn glyph_usable(info: &GlyphInfo) -> bool {
+    info.defined && (info.bitmap.is_some() || info.xadvance > 0.0)
+}
+
+/// Find the glyph for `codepoint` using the font group (first font with glyph
+/// wins), then the system fallback fonts. Returns the GlyphInfo clone and the
+/// chosen font's height; if nothing covers the codepoint, the first font's
+/// .notdef box.
 fn get_group_glyph(fonts: &[FontRef], codepoint: u32) -> (GlyphInfo, i32) {
-    for (i, arc) in fonts.iter().enumerate() {
-        let mut g = arc.lock();
-        // Whitespace always uses the first font.
-        if i > 0 && is_whitespace(codepoint) {
-            break;
-        }
-        let info = g.get_glyph(codepoint).clone();
-        let height = g.height;
-        // If the glyph has a bitmap or an advance, use this font.
-        if info.bitmap.is_some() || info.xadvance > 0.0 {
-            return (info, height);
+    let (first, height, size, aa, hinting) = {
+        let mut g = fonts[0].lock();
+        (
+            g.get_glyph(codepoint).clone(),
+            g.height,
+            g.size,
+            g.antialiasing,
+            g.hinting,
+        )
+    };
+    // Whitespace always uses the first font.
+    if is_whitespace(codepoint) || glyph_usable(&first) {
+        return (first, height);
+    }
+    for font in &fonts[1..] {
+        let mut g = font.lock();
+        let info = g.get_glyph(codepoint);
+        if glyph_usable(info) {
+            return (info.clone(), g.height);
         }
     }
-    // Fall back to first font's glyph (even if it's .notdef).
-    let mut g = fonts[0].lock();
-    let info = g.get_glyph(codepoint).clone();
-    let h = g.height;
-    (info, h)
+    fallback::system_glyph(codepoint, size, aa, hinting).unwrap_or_else(|| {
+        fallback::note_uncovered(codepoint);
+        (first, height)
+    })
+}
+
+/// Compute the rendered width of `text` in pixels using the full font group,
+/// matching the per-glyph advances `draw_text_surface` applies.
+pub(crate) fn group_text_width(fonts: &[FontRef], text: &str, tab_offset: f32) -> f32 {
+    let (space_advance, tab_size) = {
+        let f = fonts[0].lock();
+        (f.space_advance, f.tab_size)
+    };
+    let tab_w = space_advance * tab_size as f32;
+    let mut w = 0.0f32;
+    for ch in text.chars() {
+        let cp = ch as u32;
+        if cp == b'\t' as u32 {
+            let r = (w + tab_offset).rem_euclid(tab_w);
+            w += if r == 0.0 { tab_w } else { tab_w - r };
+            continue;
+        }
+        if is_whitespace(cp) {
+            w += space_advance;
+            continue;
+        }
+        let (glyph, _) = get_group_glyph(fonts, cp);
+        w += if glyph.xadvance > 0.0 {
+            glyph.xadvance
+        } else {
+            space_advance
+        };
+    }
+    w
 }
 
 /// Decode the next UTF-8 codepoint from `bytes` starting at `*pos`.
@@ -685,4 +730,74 @@ fn next_char(bytes: &[u8], pos: &mut usize) -> char {
     };
     *pos += len;
     char::from_u32(cp).unwrap_or('\u{FFFD}')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::font::{Antialiasing, FontInner, Hinting};
+    use super::*;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    fn load(name: &str) -> FontRef {
+        let path = format!("{}/../data/fonts/{}", env!("CARGO_MANIFEST_DIR"), name);
+        let inner = FontInner::load(&path, 15.0, Antialiasing::Grayscale, Hinting::Slight)
+            .expect("bundled font loads");
+        Arc::new(Mutex::new(inner))
+    }
+
+    /// First private-use-area codepoint mapped by seti.ttf but not by Lilex.
+    fn pua_codepoint(lilex: &FontRef, seti: &FontRef) -> u32 {
+        (0xE000..0xF8FF)
+            .find(|&cp| seti.lock().get_glyph(cp).defined && !lilex.lock().get_glyph(cp).defined)
+            .expect("seti.ttf maps private-use codepoints Lilex lacks")
+    }
+
+    #[test]
+    fn glyph_defined_reflects_cmap_coverage() {
+        let lilex = load("Lilex-Regular.ttf");
+        let mut g = lilex.lock();
+        assert!(g.get_glyph('A' as u32).defined);
+        assert!(!g.get_glyph('中' as u32).defined);
+    }
+
+    #[test]
+    fn group_glyph_falls_back_past_notdef() {
+        let lilex = load("Lilex-Regular.ttf");
+        let seti = load("seti.ttf");
+        let cp = pua_codepoint(&lilex, &seti);
+        let fonts = [lilex, seti];
+        let (glyph, _) = get_group_glyph(&fonts, cp);
+        assert!(glyph.defined, "group lookup must skip the .notdef box");
+    }
+
+    #[test]
+    fn group_text_width_uses_fallback_advance() {
+        let lilex = load("Lilex-Regular.ttf");
+        let seti = load("seti.ttf");
+        let cp = pua_codepoint(&lilex, &seti);
+        let expected = seti.lock().get_glyph(cp).xadvance;
+        let fonts = [lilex, seti];
+        let text = char::from_u32(cp).unwrap().to_string();
+        assert_eq!(group_text_width(&fonts, &text, 0.0), expected);
+    }
+
+    #[test]
+    fn group_glyph_returns_notdef_when_nothing_covers() {
+        let lilex = load("Lilex-Regular.ttf");
+        let fonts = [lilex];
+        // U+FFFFE is a noncharacter no font maps.
+        let (glyph, _) = get_group_glyph(&fonts, 0xFFFFE);
+        assert!(!glyph.defined);
+    }
+
+    #[test]
+    fn uncovered_codepoints_are_reported_once() {
+        let lilex = load("Lilex-Regular.ttf");
+        let fonts = [lilex];
+        let (_, _) = get_group_glyph(&fonts, 0xFFFFE);
+        assert_eq!(fallback::take_uncovered(), vec![0xFFFFE]);
+        let (_, _) = get_group_glyph(&fonts, 0xFFFFE);
+        assert!(fallback::take_uncovered().is_empty());
+    }
 }

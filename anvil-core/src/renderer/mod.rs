@@ -1,7 +1,9 @@
 mod cache;
+mod fallback;
 pub(crate) mod font;
 
-pub(crate) use cache::{RenColor, RenRect};
+pub(crate) use cache::{RenColor, RenRect, group_text_width};
+pub(crate) use fallback::take_uncovered;
 pub(crate) use font::{Antialiasing, FontInner, FontRef, Hinting};
 
 use cache::RenCache;

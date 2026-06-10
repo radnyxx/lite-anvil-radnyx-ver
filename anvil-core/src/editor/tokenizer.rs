@@ -1148,8 +1148,8 @@ pub fn tokenize_line_with_state(
         // On a 500-char markdown line with 90 patterns, where most chars
         // are plain text that doesn't start any pattern, this collapses
         // ~45k regex calls per line to a few thousand.
-        let current_byte: Option<u8> = ucharpos(line, i)
-            .and_then(|bp| line.as_bytes().get(bp - 1).copied());
+        let current_byte: Option<u8> =
+            ucharpos(line, i).and_then(|bp| line.as_bytes().get(bp - 1).copied());
         for (n, pattern) in current_syntax.patterns.iter().enumerate() {
             if let (Some(b), Some(set)) = (current_byte, pattern.open_first_byte_set()) {
                 if !fbs_contains(set, b) {
@@ -1589,11 +1589,7 @@ mod tests {
         eprintln!("first_byte_sets_have_no_false_negatives: checked {checked} matchers");
     }
 
-    fn check_matcher(
-        m: &PatternMatcher,
-        name: &str,
-        checked: &mut usize,
-    ) {
+    fn check_matcher(m: &PatternMatcher, name: &str, checked: &mut usize) {
         match m {
             PatternMatcher::Single(md) => check_one(md, name, "single", checked),
             PatternMatcher::Pair { open, close, .. } => {

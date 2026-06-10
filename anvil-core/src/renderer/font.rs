@@ -65,6 +65,11 @@ pub fn set_skip_prewarm(skip: bool) {
     SKIP_PREWARM.with(|c| c.set(skip));
 }
 
+/// Current value of the skip-prewarm flag.
+pub(crate) fn skip_prewarm() -> bool {
+    SKIP_PREWARM.with(|c| c.get())
+}
+
 thread_local! {
     /// Weak references to every `FontInner` loaded on this thread so
     /// memory-pressure paths (occluded window, macOS memory-pressure
@@ -100,7 +105,7 @@ pub fn clear_glyph_caches() {
 
 // ── Antialiasing / Hinting ────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Antialiasing {
     None,
     Grayscale,
@@ -108,7 +113,7 @@ pub enum Antialiasing {
     Subpixel,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Hinting {
     None,
     #[default]
@@ -123,6 +128,9 @@ pub enum Hinting {
 pub struct GlyphInfo {
     pub xadvance: f32,
     pub bitmap: Option<GlyphBitmap>,
+    /// False when the font has no cmap entry for the codepoint and this
+    /// glyph is the face's .notdef box. Font-group fallback keys off this.
+    pub defined: bool,
 }
 
 /// Raw pixel data for a rendered glyph.
@@ -288,14 +296,17 @@ impl FontInner {
 
     fn load_glyph(&self, codepoint: u32) -> GlyphInfo {
         if !self.on_owner_thread() {
+            // Off-thread dummy: claim defined so group fallback isn't consulted.
             return GlyphInfo {
                 xadvance: self.space_advance,
                 bitmap: None,
+                defined: true,
             };
         }
         let face = self.raw_face();
         // SAFETY: face is valid; glyph slot is valid after successful FT_Load_Glyph.
         let glyph_id: FT_UInt = unsafe { FT_Get_Char_Index(face, codepoint as FT_ULong) };
+        let defined = glyph_id != 0;
 
         // Load without hinting to get the accurate xadvance.
         let no_hint = (FT_LOAD_BITMAP_METRICS_ONLY | FT_LOAD_NO_HINTING as i32) as FT_Int32;
@@ -309,6 +320,7 @@ impl FontInner {
             return GlyphInfo {
                 xadvance,
                 bitmap: None,
+                defined,
             };
         }
 
@@ -322,40 +334,17 @@ impl FontInner {
             return GlyphInfo {
                 xadvance,
                 bitmap: None,
+                defined,
             };
         }
 
         // SAFETY: glyph slot is valid after successful FT_Render_Glyph above.
         let bitmap = unsafe { copy_glyph_bitmap((*face).glyph) };
-        GlyphInfo { xadvance, bitmap }
-    }
-
-    /// Compute rendered width of `text` in pixels.
-    /// `tab_offset` is the distance from the line's left edge to the start of `text`,
-    /// used to align tab stops: adv = tab_w - (w + tab_offset) % tab_w.
-    pub fn text_width(&mut self, text: &str, tab_offset: f32) -> f32 {
-        let tab_w = self.space_advance * self.tab_size as f32;
-        let mut w = 0.0f32;
-        for ch in text.chars() {
-            let cp = ch as u32;
-            if cp == b'\t' as u32 {
-                let r = (w + tab_offset).rem_euclid(tab_w);
-                w += if r == 0.0 { tab_w } else { tab_w - r };
-                continue;
-            }
-            let adv = if !is_whitespace(cp) {
-                let xadvance = self.get_glyph(cp).xadvance;
-                if xadvance > 0.0 {
-                    xadvance
-                } else {
-                    self.space_advance
-                }
-            } else {
-                self.space_advance
-            };
-            w += adv;
+        GlyphInfo {
+            xadvance,
+            bitmap,
+            defined,
         }
-        w
     }
 }
 

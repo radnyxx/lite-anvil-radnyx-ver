@@ -833,10 +833,7 @@ mod tests {
         let entries = load_syntax_index(&data_dir());
         for filename in &["foo.csproj", "foo.fsproj", "foo.vbproj", "foo.xaml"] {
             let matched = match_syntax_entry(filename, &entries);
-            assert!(
-                matched.is_some(),
-                "{filename} should match a syntax entry"
-            );
+            assert!(matched.is_some(), "{filename} should match a syntax entry");
             assert_eq!(
                 matched.unwrap().name,
                 "XML",
@@ -844,12 +841,8 @@ mod tests {
             );
             let def = matched.unwrap().load_full();
             assert!(def.is_some(), "XML syntax should load_full for {filename}");
-            let compiled =
-                crate::editor::tokenizer::compile_from_definition(&def.unwrap());
-            assert!(
-                compiled.is_ok(),
-                "XML syntax should compile for {filename}"
-            );
+            let compiled = crate::editor::tokenizer::compile_from_definition(&def.unwrap());
+            assert!(compiled.is_ok(), "XML syntax should compile for {filename}");
         }
     }
 
@@ -885,8 +878,7 @@ mod tests {
             crate::editor::tokenizer::compile_from_definition(&def).expect("should compile");
         let csproj = "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>net8.0</TargetFramework>\n  </PropertyGroup>\n</Project>";
         let mut state: Vec<u8> = Vec::new();
-        let mut all_types: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut all_types: std::collections::HashSet<String> = std::collections::HashSet::new();
         for line in csproj.lines() {
             let (toks, end) =
                 crate::editor::tokenizer::tokenize_line_with_state(&compiled, line, &state);
@@ -921,12 +913,15 @@ mod tests {
     #[test]
     fn makefile_filenames_match() {
         let entries = load_syntax_index(&data_dir());
-        for filename in &["Makefile", "makefile", "GNUmakefile", "rules.mk", "build.mak"] {
+        for filename in &[
+            "Makefile",
+            "makefile",
+            "GNUmakefile",
+            "rules.mk",
+            "build.mak",
+        ] {
             let matched = match_syntax_entry(filename, &entries);
-            assert!(
-                matched.is_some(),
-                "{filename} should match a syntax entry"
-            );
+            assert!(matched.is_some(), "{filename} should match a syntax entry");
             assert_eq!(
                 matched.unwrap().name,
                 "Makefile",
@@ -944,8 +939,7 @@ mod tests {
             crate::editor::tokenizer::compile_from_definition(&def).expect("should compile");
         let content = "# build targets\nall: main.o\n\tgcc -o app main.o\n\nCC := gcc\nINCLUDE = $(CC) -I./include\n";
         let mut state: Vec<u8> = Vec::new();
-        let mut all_types: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut all_types: std::collections::HashSet<String> = std::collections::HashSet::new();
         for line in content.lines() {
             let (toks, end) =
                 crate::editor::tokenizer::tokenize_line_with_state(&compiled, line, &state);

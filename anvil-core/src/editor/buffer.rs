@@ -1545,15 +1545,30 @@ mod tests {
         // save -> reload round trip reproduces the same signature, so lock
         // that invariant in across trailing whitespace, CRLF, and BOM.
         for (name, lines, crlf, bom) in [
-            ("plain", vec!["alpha\n".to_string(), "beta\n".to_string()], false, BomType::None),
+            (
+                "plain",
+                vec!["alpha\n".to_string(), "beta\n".to_string()],
+                false,
+                BomType::None,
+            ),
             (
                 "trailing_ws",
                 vec!["code   \n".to_string(), "more\t\n".to_string()],
                 false,
                 BomType::None,
             ),
-            ("crlf", vec!["one\n".to_string(), "two\n".to_string()], true, BomType::None),
-            ("bom", vec!["x\n".to_string(), "y\n".to_string()], false, BomType::Utf8),
+            (
+                "crlf",
+                vec!["one\n".to_string(), "two\n".to_string()],
+                true,
+                BomType::None,
+            ),
+            (
+                "bom",
+                vec!["x\n".to_string(), "y\n".to_string()],
+                false,
+                BomType::Utf8,
+            ),
         ] {
             let mut state = default_buffer_state();
             state.lines = lines;

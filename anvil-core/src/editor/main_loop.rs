@@ -7291,10 +7291,7 @@ pub fn run(
         // that flag, so inlay hints went stale until the next keystroke.
         // Polling the change counter per frame catches all of them in one
         // place.
-        if subsystems.has_lsp()
-            && lsp_state.transport_id.is_some()
-            && lsp_state.initialized
-        {
+        if subsystems.has_lsp() && lsp_state.transport_id.is_some() && lsp_state.initialized {
             if let Some(doc) = docs.get(active_tab) {
                 if !doc.path.is_empty() {
                     let ext = doc.path.rsplit('.').next().unwrap_or("");
@@ -7303,11 +7300,9 @@ pub fn run(
                         .unwrap_or(false);
                     if is_lsp_file {
                         if let Some(buf_id) = doc.view.buffer_id {
-                            let cur =
-                                buffer::with_buffer(buf_id, |b| Ok(b.change_id)).unwrap_or(0);
+                            let cur = buffer::with_buffer(buf_id, |b| Ok(b.change_id)).unwrap_or(0);
                             let uri = path_to_uri(&doc.path);
-                            let prev =
-                                lsp_state.last_seen_change_id.get(&uri).copied();
+                            let prev = lsp_state.last_seen_change_id.get(&uri).copied();
                             match prev {
                                 None => {
                                     lsp_state.last_seen_change_id.insert(uri, cur);
@@ -9702,6 +9697,21 @@ pub fn run(
                         );
                         bx += lw + btn_pad;
                     }
+                }
+
+                // Warn once per session per codepoint when a drawn character
+                // is covered by no configured or installed system font.
+                let uncovered = crate::renderer::take_uncovered();
+                if let Some(&cp) = uncovered.first() {
+                    let more = match uncovered.len() {
+                        1 => String::new(),
+                        n => format!(" and {} more", n - 1),
+                    };
+                    let msg = format!(
+                        "No installed font covers U+{cp:04X}{more} -- install a font for this script or set fonts.code.paths in config"
+                    );
+                    log::warn!("{msg}");
+                    info_message = Some((msg, Instant::now()));
                 }
 
                 // Draw info message (auto-dismiss after 3s, or on any key).

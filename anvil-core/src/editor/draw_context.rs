@@ -107,8 +107,8 @@ impl DrawContext for NativeDrawContext {
 
     fn font_width(&self, font_id: u64, text: &str) -> f64 {
         self.get_font(font_id)
-            .and_then(|fonts| fonts.as_ref().first())
-            .map(|f| f.lock().text_width(text, 0.0) as f64)
+            .filter(|fonts| !fonts.is_empty())
+            .map(|fonts| crate::renderer::group_text_width(fonts, text, 0.0) as f64)
             .unwrap_or(0.0)
     }
 

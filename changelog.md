@@ -1,5 +1,10 @@
 # Change Log
 
+## [2.11.32] - 2026-06-09 -- Non-Latin text no longer renders as squares.
+
+* Fixed: characters outside the bundled Lilex fonts' coverage (Chinese, Japanese, Korean, Thai, Arabic, Hebrew, Indic scripts, ...) drew as .notdef boxes in file content, tab titles, paths, and the status bar. Font-group fallback now detects unmapped codepoints (the old check accepted the .notdef box as a real glyph, so configured `paths` fallbacks never fired), and codepoints missing from every configured font lazily fall back to installed system fonts: YaHei, JhengHei, Yu Gothic, Malgun, Segoe UI, Leelawadee UI, Nirmala UI, Ebrima on Windows; PingFang, Hiragino, Apple SD Gothic Neo, Thonburi, Geeza Pro, Khmer/Lao MN, Devanagari/Tamil Sangam MN, Kefa, Arial Unicode on macOS; the Noto CJK collections plus every installed per-script Noto face, WenQuanYi, and DejaVu on Linux. Fallback fonts load one at a time on first miss, so sessions without non-Latin text pay nothing. Text width measurement uses the same group-and-fallback advances as drawing, so carets and selections stay aligned over fallback glyphs.
+* When a drawn character is covered by no configured or installed font, the editor now shows a dismissable warning bar (and logs a warning) naming the codepoint -- e.g. "No installed font covers U+0E01" -- instead of silently drawing a box. Each codepoint is reported once per session.
+
 ## [2.11.31] - 2026-05-22 -- Autosave no longer triggers spurious "file changed on disk" prompts.
 
 * Fixed: NoteAnvil's autosave writes echoed back through the directory watcher and were misread as external edits, so resuming typing right after an autosave raised a false "File changed on disk, reload?" prompt.
