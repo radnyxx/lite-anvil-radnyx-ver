@@ -99,19 +99,29 @@
   "BTreeSet": "keyword2",
   "Box": "keyword2",
   "Err": "literal",
+  "Fn": "keyword2",
+  "FnMut": "keyword2",
+  "FnOnce": "keyword2",
   "HashMap": "keyword2",
   "HashSet": "keyword2",
+  "JoinHandle": "keyword2",
+  "LinkedList": "keyword2",
   "Mutex": "keyword2",
   "None": "literal",
   "Ok": "literal",
   "Option": "keyword2",
+  "Rc": "keyword2",
   "Receiver": "keyword2",
   "Result": "keyword2",
+  "RwLock": "keyword2",
   "Self": "keyword",
   "Sender": "keyword2",
   "Some": "literal",
   "String": "keyword2",
   "Vec": "keyword2",
+  "VecDeque": "keyword2",
+  "Weak": "keyword2",
+  "arena": "keyword",
   "as": "keyword",
   "async": "keyword",
   "await": "keyword",
@@ -122,7 +132,6 @@
   "continue": "keyword",
   "crate": "keyword",
   "defer": "keyword",
-  "dyn": "keyword",
   "else": "keyword",
   "enum": "keyword",
   "extern": "keyword",
@@ -146,13 +155,12 @@
   "match": "keyword",
   "mod": "keyword",
   "mut": "keyword",
+  "package": "keyword",
   "pub": "keyword",
-  "ref": "keyword",
   "return": "keyword",
   "select": "keyword",
   "self": "keyword",
   "static": "keyword",
-  "str": "keyword2",
   "struct": "keyword",
   "super": "keyword",
   "trait": "keyword",
@@ -185,6 +193,39 @@
   "type": "symbol"
 }
 },
+  "22": {
+  "kind": "object",
+  "values": {
+  "pattern": {
+  "$ref": "23"
+},
+  "type": "string"
+}
+},
+  "23": {
+  "kind": "array",
+  "values": ["r#+\"", "\"#+"]
+},
+  "24": {
+  "kind": "object",
+  "values": {
+  "pattern": {
+  "$ref": "25"
+},
+  "type": "string"
+}
+},
+  "25": {
+  "kind": "array",
+  "values": ["r\"", "\""]
+},
+  "26": {
+  "kind": "object",
+  "values": {
+  "pattern": "#%[[%a_][%w_]*",
+  "type": "keyword"
+}
+},
   "3": {
   "kind": "array",
   "values": ["/*", "*/"]
@@ -200,9 +241,15 @@
 }, {
   "$ref": "7"
 }, {
+  "$ref": "22"
+}, {
+  "$ref": "24"
+}, {
   "$ref": "10"
 }, {
   "$ref": "12"
+}, {
+  "$ref": "26"
 }, {
   "$ref": "13"
 }, {

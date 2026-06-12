@@ -822,6 +822,72 @@ mod tests {
     }
 
     #[test]
+    fn gossamer_covers_0_12_surface() {
+        // Gossamer 0.12.0: `arena` blocks, `package` reserved, Rc/Weak
+        // transparency, spawn JoinHandles, Fn-trait types, attributes,
+        // and raw strings. Rust-only `dyn`/`ref`/`str` must be gone.
+        let entries = load_syntax_index(&data_dir());
+        let entry = match_syntax_entry("mem.gos", &entries).expect("gossamer entry");
+        let def = entry.load_full().expect("load_full");
+        for kw in ["arena", "package"] {
+            assert_eq!(
+                def.symbols.get(kw).map(String::as_str),
+                Some("keyword"),
+                "{kw} must be a keyword"
+            );
+        }
+        for ty in [
+            "Rc",
+            "Weak",
+            "JoinHandle",
+            "Fn",
+            "FnMut",
+            "FnOnce",
+            "RwLock",
+            "VecDeque",
+            "LinkedList",
+        ] {
+            assert_eq!(
+                def.symbols.get(ty).map(String::as_str),
+                Some("keyword2"),
+                "{ty} must be a type symbol"
+            );
+        }
+        for absent in ["dyn", "ref", "str"] {
+            assert!(
+                !def.symbols.contains_key(absent),
+                "`{absent}` is Rust-only, not Gossamer"
+            );
+        }
+        let compiled = crate::editor::tokenizer::compile_from_definition(&def)
+            .expect("compile gossamer syntax");
+        let attr_line = "#[derive(Clone, PartialEq, Debug)]";
+        let toks = crate::editor::tokenizer::tokenize_line(&compiled, attr_line);
+        assert!(
+            toks.iter()
+                .any(|t| t.token_type == "keyword" && t.text.starts_with("#[")),
+            "attribute should tokenize as keyword, got {toks:?}"
+        );
+        let joined: String = toks.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(joined, attr_line);
+        let raw_line = r##"let p = r"C:\no\escape" + r#"has "quotes""#"##;
+        let toks = crate::editor::tokenizer::tokenize_line(&compiled, raw_line);
+        // Leading whitespace folds into the following token's text.
+        let strings: Vec<_> = toks
+            .iter()
+            .filter(|t| t.token_type == "string")
+            .map(|t| t.text.trim_start())
+            .collect();
+        assert_eq!(
+            strings,
+            vec!["r\"C:\\no\\escape\"", r##"r#"has "quotes""#"##],
+            "raw strings should tokenize whole, got {toks:?}"
+        );
+        let joined: String = toks.iter().map(|t| t.text.as_str()).collect();
+        assert_eq!(joined, raw_line);
+    }
+
+    #[test]
     fn match_syntax_entry_returns_none_for_unknown() {
         let entries = load_syntax_index(&data_dir());
         let matched = match_syntax_entry("file.zzzzz_unknown", &entries);

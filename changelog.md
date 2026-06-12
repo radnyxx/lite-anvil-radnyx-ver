@@ -1,5 +1,9 @@
 # Change Log
 
+## [2.11.34] - 2026-06-11 -- Gossamer 0.12.0 syntax support.
+
+* Gossamer syntax updated to the 0.12.0 language surface: `arena` (contextual keyword for arena blocks) and the reserved `package` highlight as keywords; `Rc`, `Weak`, `JoinHandle`, `Fn`, `FnMut`, `FnOnce`, `RwLock`, `VecDeque`, and `LinkedList` highlight as types; `#[derive(...)]`-style attributes and raw strings (`r"..."`, `r#"..."#`) tokenize correctly. Removed the Rust-only `dyn`, `ref`, and `str` symbols, which are not part of Gossamer.
+
 ## [2.11.33] - 2026-06-09 -- Find/Replace regex can match newlines.
 
 * Fixed: the find bar searched each line separately with its trailing newline stripped, so `\n` in a regex could never match -- replacing `.*-.*\n` with nothing left an empty line behind instead of removing the line. Find now searches the whole document as one subject, so patterns can include `\n` and even span multiple lines; a match that consumes a line's newline ends at column 1 of the next line, and replacing it deletes the line break too. `^` and `$` keep their per-line meaning.
