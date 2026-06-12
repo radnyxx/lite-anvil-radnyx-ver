@@ -64,7 +64,6 @@ jobs:
           cp target/release/nano-anvil "$ARCHIVE_BASE/"
           cp target/release/note-anvil "$ARCHIVE_BASE/"
           cp -r data "$ARCHIVE_BASE/"
-          cp -r data-nano "$ARCHIVE_BASE/"
           # SDL3 is statically linked into the binaries — no libSDL3.so
           # to ship, no lib/ directory to create, no RPATH to manage.
           cp resources/linux/com.lite_anvil.LiteAnvil.desktop "$ARCHIVE_BASE/"
@@ -167,7 +166,7 @@ jobs:
           }
 
           build_appimage lite-anvil data Lite-Anvil
-          build_appimage nano-anvil data-nano Nano-Anvil
+          build_appimage nano-anvil data Nano-Anvil
           build_appimage note-anvil data Note-Anvil
 
       - name: Upload Linux artifacts
@@ -239,7 +238,6 @@ jobs:
           Copy-Item target\release\nano-anvil.exe "$stage\"
           Copy-Item target\release\note-anvil.exe "$stage\"
           Copy-Item -Recurse data "$stage\"
-          Copy-Item -Recurse data-nano "$stage\"
           Copy-Item resources\windows\*.ps1 "$stage\"
 
           # Safety net for any transitive cmake-built C dep that still links

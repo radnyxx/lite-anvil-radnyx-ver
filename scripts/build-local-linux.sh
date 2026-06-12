@@ -30,7 +30,6 @@ cp target/release/lite-anvil "$STAGE_DIR/"
 cp target/release/nano-anvil "$STAGE_DIR/"
 cp target/release/note-anvil "$STAGE_DIR/"
 cp -r data "$STAGE_DIR/"
-cp -r data-nano "$STAGE_DIR/"
 # SDL3 is statically linked via sdl3-sys — nothing to bundle under lib/.
 cp resources/linux/com.lite_anvil.LiteAnvil.desktop "$STAGE_DIR/"
 cp resources/linux/com.nano_anvil.NanoAnvil.desktop "$STAGE_DIR/"

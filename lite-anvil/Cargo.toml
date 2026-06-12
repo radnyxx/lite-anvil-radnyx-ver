@@ -19,7 +19,7 @@ assets = [
     ["target/release/nano-anvil",                            "usr/bin/",                                              "755"],
     ["target/release/note-anvil",                            "usr/bin/",                                              "755"],
     ["../data/**/*",                                         "usr/share/lite-anvil/data/",                            "644"],
-    ["../data-nano/**/*",                                    "usr/share/nano-anvil/data/",                            "644"],
+    ["../data/**/*",                                         "usr/share/nano-anvil/data/",                            "644"],
     ["../resources/linux/com.lite_anvil.LiteAnvil.desktop",  "usr/share/applications/lite-anvil.desktop",             "644"],
     ["../resources/linux/com.nano_anvil.NanoAnvil.desktop",  "usr/share/applications/nano-anvil.desktop",             "644"],
     ["../resources/linux/com.note_anvil.NoteAnvil.desktop",  "usr/share/applications/note-anvil.desktop",             "644"],
@@ -43,7 +43,7 @@ assets = [
     { source = "../resources/icons/nano-anvil.png",                   dest = "/usr/share/icons/hicolor/256x256/apps/nano-anvil.png", mode = "644" },
     { source = "../resources/icons/note-anvil.png",                   dest = "/usr/share/icons/hicolor/256x256/apps/note-anvil.png", mode = "644" },
     { source = "../data/**/*",                                        dest = "/usr/share/lite-anvil/data/",                          mode = "644" },
-    { source = "../data-nano/**/*",                                   dest = "/usr/share/nano-anvil/data/",                          mode = "644" },
+    { source = "../data/**/*",                                        dest = "/usr/share/nano-anvil/data/",                          mode = "644" },
 ]
 
 [[bin]]

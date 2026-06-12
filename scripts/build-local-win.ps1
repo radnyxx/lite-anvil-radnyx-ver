@@ -52,7 +52,6 @@ if (Test-Path $NanoBinary) {
     Copy-Item -Path $NanoBinary -Destination $StageDir
 }
 Copy-Item -Path (Join-Path $RootDir 'data') -Destination $StageDir -Recurse
-Copy-Item -Path (Join-Path $RootDir 'data-nano') -Destination $StageDir -Recurse
 $WindowsResources = Join-Path $RootDir 'resources\windows\*.ps1'
 if (Test-Path $WindowsResources) {
     Copy-Item -Path $WindowsResources -Destination $StageDir

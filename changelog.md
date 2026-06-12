@@ -1,5 +1,10 @@
 # Change Log
 
+## [2.11.35] - 2026-06-12 -- Kotlin syntax improvements; unified data/: nano-anvil now highlights all languages.
+
+* Kotlin syntax: added missing modifier keywords (`actual`, `crossinline`, `dynamic`, `expect`, `external`, `noinline`, `out`, `where`) and stdlib types (`Collection`, `Comparable`, `Iterable`, `Iterator`, `MutableCollection`, `MutableIterable`, `MutableIterator`, `Pair`, `Sequence`, `Triple`). Uppercase-starting identifiers adjacent to whitespace, `.`, or `(` now highlight as types, matching the Java definition.
+* nano-anvil now uses the same `data/` asset directory as lite-anvil. Previously it shipped a separate `data-nano/` with only 21 syntax definitions; the split is removed and nano-anvil highlights all 67 languages.
+
 ## [2.11.34] - 2026-06-11 -- Gossamer 0.12.0 syntax support.
 
 * Gossamer syntax updated to the 0.12.0 language surface: `arena` (contextual keyword for arena blocks) and the reserved `package` highlight as keywords; `Rc`, `Weak`, `JoinHandle`, `Fn`, `FnMut`, `FnOnce`, `RwLock`, `VecDeque`, and `LinkedList` highlight as types; `#[derive(...)]`-style attributes and raw strings (`r"..."`, `r#"..."#`) tokenize correctly. Removed the Rust-only `dyn`, `ref`, and `str` symbols, which are not part of Gossamer.

@@ -77,18 +77,15 @@ install_linux() {
     $sudo_cmd rsync -a --delete "$data_src/" "$share_dir/" 2>/dev/null \
         || { $sudo_cmd rm -rf "$share_dir"; $sudo_cmd cp -r "$data_src/." "$share_dir/"; }
 
-    local data_nano_src="$stage_dir/data-nano"
-    if [ -d "$data_nano_src" ]; then
-        local share_nano_dir
-        if [ "$SYSTEM" -eq 1 ]; then
-            share_nano_dir=/usr/local/share/nano-anvil
-        else
-            share_nano_dir="$HOME/.local/share/nano-anvil"
-        fi
-        $sudo_cmd mkdir -p "$share_nano_dir"
-        $sudo_cmd rsync -a --delete "$data_nano_src/" "$share_nano_dir/" 2>/dev/null \
-            || { $sudo_cmd rm -rf "$share_nano_dir"; $sudo_cmd cp -r "$data_nano_src/." "$share_nano_dir/"; }
+    local share_nano_dir
+    if [ "$SYSTEM" -eq 1 ]; then
+        share_nano_dir=/usr/local/share/nano-anvil
+    else
+        share_nano_dir="$HOME/.local/share/nano-anvil"
     fi
+    $sudo_cmd mkdir -p "$share_nano_dir"
+    $sudo_cmd rsync -a --delete "$data_src/" "$share_nano_dir/" 2>/dev/null \
+        || { $sudo_cmd rm -rf "$share_nano_dir"; $sudo_cmd cp -r "$data_src/." "$share_nano_dir/"; }
 
     # SDL3 is statically linked — no libSDL3 to install next to the binary.
 
