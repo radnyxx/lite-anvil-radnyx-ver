@@ -9,6 +9,7 @@ pub mod draw_context;
 pub mod empty_view;
 pub mod error;
 pub mod event;
+pub mod field_history;
 pub mod filesystem;
 pub mod git;
 pub mod keymap;

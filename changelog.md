@@ -1,5 +1,9 @@
 # Change Log
 
+## [2.12.0] - 2026-06-15 -- Clipboard and undo/redo shortcuts work inside find/replace and other dialog inputs.
+
+* Added cut, copy, paste, undo, redo to find/replace bar, command palette, file picker, etc.
+
 ## [2.11.35] - 2026-06-12 -- Kotlin syntax improvements; unified data/: nano-anvil now highlights all languages.
 
 * Kotlin syntax: added missing modifier keywords (`actual`, `crossinline`, `dynamic`, `expect`, `external`, `noinline`, `out`, `where`) and stdlib types (`Collection`, `Comparable`, `Iterable`, `Iterator`, `MutableCollection`, `MutableIterable`, `MutableIterator`, `Pair`, `Sequence`, `Triple`). Uppercase-starting identifiers adjacent to whitespace, `.`, or `(` now highlight as types, matching the Java definition.

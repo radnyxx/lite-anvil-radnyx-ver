@@ -68,8 +68,14 @@ impl NativeKeymap {
     /// Returns None if no binding matches.
     pub fn on_key_pressed(&mut self, key: &str, mods: Modifiers) -> Option<&[String]> {
         self.modkeys = mods;
+        self.commands_for(key, mods)
+    }
 
-        // Build stroke from key + modifiers.
+    /// Resolve a keystroke to its bound commands without recording modifier
+    /// state. Use for read-only checks (e.g. routing the undo/redo bindings
+    /// into a focused dialog input) where `on_key_pressed`'s side effect and
+    /// `&mut self` borrow are unwanted.
+    pub fn commands_for(&self, key: &str, mods: Modifiers) -> Option<&[String]> {
         let stroke = build_stroke(key, &mods);
         let norm = normalize_stroke(&stroke);
         self.map.get(&norm).map(|v| v.as_slice())
@@ -452,6 +458,36 @@ mod tests {
         let cmds = km.on_key_pressed("q", mods);
         assert!(cmds.is_some());
         assert_eq!(cmds.unwrap()[0], "core:quit");
+    }
+
+    #[test]
+    fn commands_for_resolves_default_undo_redo_without_side_effects() {
+        let km = NativeKeymap::with_defaults();
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let ctrl_shift = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(km.commands_for("z", ctrl).unwrap(), ["doc:undo"]);
+        assert_eq!(km.commands_for("y", ctrl).unwrap(), ["doc:redo"]);
+        assert_eq!(km.commands_for("z", ctrl_shift).unwrap(), ["doc:redo"]);
+        // Pure lookup: modifier state is untouched.
+        assert_eq!(km.modkeys, Modifiers::default());
+    }
+
+    #[test]
+    fn commands_for_follows_a_custom_undo_rebinding() {
+        let mut km = NativeKeymap::with_defaults();
+        km.add("ctrl+u", &["doc:undo"]);
+        let mods = Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(km.commands_for("u", mods).unwrap(), ["doc:undo"]);
     }
 
     #[test]

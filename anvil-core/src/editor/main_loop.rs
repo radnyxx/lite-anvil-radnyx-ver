@@ -1356,6 +1356,20 @@ pub fn run(
     let mut cmdview_selected: usize = 0;
     let mut cmdview_label = String::new();
 
+    // Per-field undo/redo history for the dialog text inputs. Each input keeps
+    // its own stack so the undo/redo shortcuts edit the focused field rather
+    // than the document buffer (VS Code input-box behaviour).
+    use crate::editor::field_history::{FieldEdit, FieldHistory};
+    let mut find_history = FieldHistory::default();
+    let mut replace_history = FieldHistory::default();
+    let mut cmdview_history = FieldHistory::default();
+    let mut project_search_history = FieldHistory::default();
+    let mut project_replace_search_history = FieldHistory::default();
+    let mut project_replace_with_history = FieldHistory::default();
+    let mut palette_history = FieldHistory::default();
+    let mut notes_search_history = FieldHistory::default();
+    let mut sidebar_new_file_history = FieldHistory::default();
+
     // Project-wide search state.
     // Git status view.
     let mut git_status_active = false;
@@ -1853,6 +1867,33 @@ pub fn run(
             // Any event counts as activity for idle-drop tracking.
             last_activity = Instant::now();
             dropped_caches_for_idle = false;
+            // Scope each dialog field's undo history to a single open session:
+            // while the input is closed its history stays cleared, so reopening
+            // starts fresh and Ctrl+Z can never restore text from a previous
+            // session into an unrelated field.
+            if !find_active {
+                find_history.clear();
+                replace_history.clear();
+            }
+            if !cmdview_active {
+                cmdview_history.clear();
+            }
+            if !project_search_active {
+                project_search_history.clear();
+            }
+            if !project_replace_active {
+                project_replace_search_history.clear();
+                project_replace_with_history.clear();
+            }
+            if !palette_active {
+                palette_history.clear();
+            }
+            if !notes_search_focused {
+                notes_search_history.clear();
+            }
+            if sidebar_new_file_dir.is_none() {
+                sidebar_new_file_history.clear();
+            }
             match &event {
                 EditorEvent::Quit => {
                     if single_file_mode && docs.iter().any(doc_is_modified) {
@@ -1954,8 +1995,62 @@ pub fn run(
 
                     // Notes-mode sidebar search input.
                     if subsystems.has_notes_mode() && notes_search_focused {
+                        if let Some(is_redo) = keymap_field_undo(&keymap, key.as_str(), mods) {
+                            let restored = if is_redo {
+                                notes_search_history.redo(&notes_search, notes_search.len())
+                            } else {
+                                notes_search_history.undo(&notes_search, notes_search.len())
+                            };
+                            if let Some((t, _)) = restored {
+                                notes_search = t;
+                            }
+                            redraw = true;
+                            continue;
+                        }
+                        if let Some(action) = keymap_field_clipboard(&keymap, key.as_str(), mods) {
+                            match action {
+                                FieldClipboard::Copy => {
+                                    if !notes_search.is_empty() {
+                                        crate::window::set_clipboard_text(&notes_search);
+                                    }
+                                }
+                                FieldClipboard::Cut => {
+                                    if !notes_search.is_empty() {
+                                        crate::window::set_clipboard_text(&notes_search);
+                                        notes_search_history.record(
+                                            &notes_search,
+                                            notes_search.len(),
+                                            FieldEdit::Replace,
+                                            buffer::now_secs(),
+                                        );
+                                        notes_search.clear();
+                                    }
+                                }
+                                FieldClipboard::Paste => {
+                                    if let Some(clip) = crate::window::get_clipboard_text() {
+                                        notes_search_history.record(
+                                            &notes_search,
+                                            notes_search.len(),
+                                            FieldEdit::Replace,
+                                            buffer::now_secs(),
+                                        );
+                                        append_clipboard_line(&mut notes_search, &clip);
+                                    }
+                                }
+                            }
+                            redraw = true;
+                            continue;
+                        }
                         match key.as_str() {
                             "backspace" => {
+                                if !notes_search.is_empty() {
+                                    notes_search_history.record(
+                                        &notes_search,
+                                        notes_search.len(),
+                                        FieldEdit::Delete,
+                                        buffer::now_secs(),
+                                    );
+                                }
                                 notes_search.pop();
                                 redraw = true;
                                 continue;
@@ -2104,6 +2199,60 @@ pub fn run(
 
                     // Inline new-file input in the sidebar intercepts keys.
                     if sidebar_new_file_dir.is_some() && matches!(nag, Nag::None) {
+                        if let Some(is_redo) = keymap_field_undo(&keymap, key.as_str(), mods) {
+                            let restored = if is_redo {
+                                sidebar_new_file_history
+                                    .redo(&sidebar_new_file_name, sidebar_new_file_cursor)
+                            } else {
+                                sidebar_new_file_history
+                                    .undo(&sidebar_new_file_name, sidebar_new_file_cursor)
+                            };
+                            if let Some((t, c)) = restored {
+                                sidebar_new_file_name = t;
+                                sidebar_new_file_cursor = c.min(sidebar_new_file_name.len());
+                            }
+                            redraw = true;
+                            continue;
+                        }
+                        if let Some(action) = keymap_field_clipboard(&keymap, key.as_str(), mods) {
+                            match action {
+                                FieldClipboard::Copy => {
+                                    if !sidebar_new_file_name.is_empty() {
+                                        crate::window::set_clipboard_text(&sidebar_new_file_name);
+                                    }
+                                }
+                                FieldClipboard::Cut => {
+                                    if !sidebar_new_file_name.is_empty() {
+                                        crate::window::set_clipboard_text(&sidebar_new_file_name);
+                                        sidebar_new_file_history.record(
+                                            &sidebar_new_file_name,
+                                            sidebar_new_file_cursor,
+                                            FieldEdit::Replace,
+                                            buffer::now_secs(),
+                                        );
+                                        sidebar_new_file_name.clear();
+                                        sidebar_new_file_cursor = 0;
+                                    }
+                                }
+                                FieldClipboard::Paste => {
+                                    if let Some(clip) = crate::window::get_clipboard_text() {
+                                        sidebar_new_file_history.record(
+                                            &sidebar_new_file_name,
+                                            sidebar_new_file_cursor,
+                                            FieldEdit::Replace,
+                                            buffer::now_secs(),
+                                        );
+                                        sidebar_new_file_cursor = insert_clipboard_line(
+                                            &mut sidebar_new_file_name,
+                                            sidebar_new_file_cursor,
+                                            &clip,
+                                        );
+                                    }
+                                }
+                            }
+                            redraw = true;
+                            continue;
+                        }
                         match key.as_str() {
                             "escape" => {
                                 sidebar_new_file_dir = None;
@@ -2180,6 +2329,12 @@ pub fn run(
                                 }
                             }
                             "backspace" if sidebar_new_file_cursor > 0 => {
+                                sidebar_new_file_history.record(
+                                    &sidebar_new_file_name,
+                                    sidebar_new_file_cursor,
+                                    FieldEdit::Delete,
+                                    buffer::now_secs(),
+                                );
                                 let prev = sidebar_new_file_name[..sidebar_new_file_cursor]
                                     .char_indices()
                                     .next_back()
@@ -2190,6 +2345,12 @@ pub fn run(
                             }
                             "backspace" => {}
                             "delete" if sidebar_new_file_cursor < sidebar_new_file_name.len() => {
+                                sidebar_new_file_history.record(
+                                    &sidebar_new_file_name,
+                                    sidebar_new_file_cursor,
+                                    FieldEdit::Delete,
+                                    buffer::now_secs(),
+                                );
                                 let next = sidebar_new_file_name[sidebar_new_file_cursor..]
                                     .char_indices()
                                     .nth(1)
@@ -2317,6 +2478,89 @@ pub fn run(
                             }
                         }
 
+                        if let Some(is_redo) = keymap_field_undo(&keymap, key.as_str(), mods) {
+                            // Route the undo/redo bindings to the picker input.
+                            let restored = if is_redo {
+                                cmdview_history.redo(&cmdview_text, cmdview_cursor)
+                            } else {
+                                cmdview_history.undo(&cmdview_text, cmdview_cursor)
+                            };
+                            if let Some((t, c)) = restored {
+                                cmdview_text = t;
+                                cmdview_cursor = c.min(cmdview_text.len());
+                                refresh_cmdview_suggestions(
+                                    cmdview_mode,
+                                    &cmdview_text,
+                                    &project_root,
+                                    &recent_files,
+                                    &recent_projects,
+                                    !single_file_mode,
+                                    &mut cmdview_suggestions,
+                                );
+                                cmdview_selected = 0;
+                            }
+                            redraw = true;
+                            continue;
+                        }
+                        if let Some(action) = keymap_field_clipboard(&keymap, key.as_str(), mods) {
+                            match action {
+                                FieldClipboard::Copy => {
+                                    if !cmdview_text.is_empty() {
+                                        crate::window::set_clipboard_text(&cmdview_text);
+                                    }
+                                }
+                                FieldClipboard::Cut => {
+                                    if !cmdview_text.is_empty() {
+                                        crate::window::set_clipboard_text(&cmdview_text);
+                                        cmdview_history.record(
+                                            &cmdview_text,
+                                            cmdview_cursor,
+                                            FieldEdit::Replace,
+                                            buffer::now_secs(),
+                                        );
+                                        cmdview_text.clear();
+                                        cmdview_cursor = 0;
+                                        refresh_cmdview_suggestions(
+                                            cmdview_mode,
+                                            &cmdview_text,
+                                            &project_root,
+                                            &recent_files,
+                                            &recent_projects,
+                                            !single_file_mode,
+                                            &mut cmdview_suggestions,
+                                        );
+                                        cmdview_selected = 0;
+                                    }
+                                }
+                                FieldClipboard::Paste => {
+                                    if let Some(clip) = crate::window::get_clipboard_text() {
+                                        cmdview_history.record(
+                                            &cmdview_text,
+                                            cmdview_cursor,
+                                            FieldEdit::Replace,
+                                            buffer::now_secs(),
+                                        );
+                                        cmdview_cursor = insert_clipboard_line(
+                                            &mut cmdview_text,
+                                            cmdview_cursor,
+                                            &clip,
+                                        );
+                                        refresh_cmdview_suggestions(
+                                            cmdview_mode,
+                                            &cmdview_text,
+                                            &project_root,
+                                            &recent_files,
+                                            &recent_projects,
+                                            !single_file_mode,
+                                            &mut cmdview_suggestions,
+                                        );
+                                        cmdview_selected = 0;
+                                    }
+                                }
+                            }
+                            redraw = true;
+                            continue;
+                        }
                         match key.as_str() {
                             "escape" => {
                                 cmdview_active = false;
@@ -2411,6 +2655,12 @@ pub fn run(
                                             }
                                         } else if ap.is_dir() {
                                             // Navigate into directory.
+                                            cmdview_history.record(
+                                                &cmdview_text,
+                                                cmdview_cursor,
+                                                FieldEdit::Replace,
+                                                buffer::now_secs(),
+                                            );
                                             cmdview_text = dir_with_trailing_sep(&path);
                                             cmdview_cursor = cmdview_text.len();
                                             cmdview_suggestions =
@@ -2564,6 +2814,12 @@ pub fn run(
                                         // Save current document to the chosen path.
                                         let save_path = if p.is_dir() {
                                             // User selected a directory -- stay in cmdview.
+                                            cmdview_history.record(
+                                                &cmdview_text,
+                                                cmdview_cursor,
+                                                FieldEdit::Replace,
+                                                buffer::now_secs(),
+                                            );
                                             cmdview_text = dir_with_trailing_sep(&path);
                                             cmdview_cursor = cmdview_text.len();
                                             cmdview_suggestions = path_suggest(&cmdview_text, &project_root, false);
@@ -2747,6 +3003,12 @@ pub fn run(
                                 if !cmdview_suggestions.is_empty()
                                     && cmdview_selected < cmdview_suggestions.len()
                                 => {
+                                    cmdview_history.record(
+                                        &cmdview_text,
+                                        cmdview_cursor,
+                                        FieldEdit::Replace,
+                                        buffer::now_secs(),
+                                    );
                                     cmdview_text = cmdview_suggestions[cmdview_selected].clone();
                                     cmdview_cursor = cmdview_text.len();
                                     let dirs_only = cmdview_mode == CmdViewMode::OpenFolder;
@@ -2788,6 +3050,12 @@ pub fn run(
                                     // users aren't forced to press Enter —
                                     // which also commits the action and can
                                     // race a late autocomplete update.
+                                    cmdview_history.record(
+                                        &cmdview_text,
+                                        cmdview_cursor,
+                                        FieldEdit::Replace,
+                                        buffer::now_secs(),
+                                    );
                                     cmdview_text =
                                         cmdview_suggestions[cmdview_selected].clone();
                                     cmdview_cursor = cmdview_text.len();
@@ -2811,6 +3079,12 @@ pub fn run(
                             }
                             "delete"
                                 if cmdview_cursor < cmdview_text.len() => {
+                                    cmdview_history.record(
+                                        &cmdview_text,
+                                        cmdview_cursor,
+                                        FieldEdit::Delete,
+                                        buffer::now_secs(),
+                                    );
                                     let next = cmdview_next_char(&cmdview_text, cmdview_cursor);
                                     cmdview_text.replace_range(cmdview_cursor..next, "");
                                     refresh_cmdview_suggestions(
@@ -2825,6 +3099,14 @@ pub fn run(
                                     cmdview_selected = 0;
                                 }
                             "backspace" => {
+                                if cmdview_cursor > 0 {
+                                    cmdview_history.record(
+                                        &cmdview_text,
+                                        cmdview_cursor,
+                                        FieldEdit::Delete,
+                                        buffer::now_secs(),
+                                    );
+                                }
                                 if mods.ctrl {
                                     // Delete the previous path segment up to the cursor.
                                     let segment_start =
@@ -2884,6 +3166,78 @@ pub fn run(
                                 continue;
                             }
                         }
+                        if let Some(is_redo) = keymap_field_undo(&keymap, key.as_str(), mods) {
+                            let restored = if is_redo {
+                                project_search_history
+                                    .redo(&project_search_query, project_search_query.len())
+                            } else {
+                                project_search_history
+                                    .undo(&project_search_query, project_search_query.len())
+                            };
+                            if let Some((t, _)) = restored {
+                                project_search_query = t;
+                                project_search_results = run_project_search(
+                                    &project_search_query,
+                                    &project_root,
+                                    project_use_regex,
+                                    project_whole_word,
+                                    project_case_insensitive,
+                                );
+                                project_search_selected = 0;
+                            }
+                            redraw = true;
+                            continue;
+                        }
+                        if let Some(action) = keymap_field_clipboard(&keymap, key.as_str(), mods) {
+                            match action {
+                                FieldClipboard::Copy => {
+                                    if !project_search_query.is_empty() {
+                                        crate::window::set_clipboard_text(&project_search_query);
+                                    }
+                                }
+                                FieldClipboard::Cut => {
+                                    if !project_search_query.is_empty() {
+                                        crate::window::set_clipboard_text(&project_search_query);
+                                        project_search_history.record(
+                                            &project_search_query,
+                                            project_search_query.len(),
+                                            FieldEdit::Replace,
+                                            buffer::now_secs(),
+                                        );
+                                        project_search_query.clear();
+                                        project_search_results = run_project_search(
+                                            &project_search_query,
+                                            &project_root,
+                                            project_use_regex,
+                                            project_whole_word,
+                                            project_case_insensitive,
+                                        );
+                                        project_search_selected = 0;
+                                    }
+                                }
+                                FieldClipboard::Paste => {
+                                    if let Some(clip) = crate::window::get_clipboard_text() {
+                                        project_search_history.record(
+                                            &project_search_query,
+                                            project_search_query.len(),
+                                            FieldEdit::Replace,
+                                            buffer::now_secs(),
+                                        );
+                                        append_clipboard_line(&mut project_search_query, &clip);
+                                        project_search_results = run_project_search(
+                                            &project_search_query,
+                                            &project_root,
+                                            project_use_regex,
+                                            project_whole_word,
+                                            project_case_insensitive,
+                                        );
+                                        project_search_selected = 0;
+                                    }
+                                }
+                            }
+                            redraw = true;
+                            continue;
+                        }
                         match key.as_str() {
                             "escape" => {
                                 project_search_active = false;
@@ -2933,6 +3287,14 @@ pub fn run(
                                     .min(project_search_results.len() - 1);
                             }
                             "backspace" => {
+                                if !project_search_query.is_empty() {
+                                    project_search_history.record(
+                                        &project_search_query,
+                                        project_search_query.len(),
+                                        FieldEdit::Delete,
+                                        buffer::now_secs(),
+                                    );
+                                }
                                 project_search_query.pop();
                                 project_search_results = run_project_search(
                                     &project_search_query,
@@ -2979,6 +3341,122 @@ pub fn run(
                                 redraw = true;
                                 continue;
                             }
+                        }
+                        if let Some(is_redo) = keymap_field_undo(&keymap, key.as_str(), mods) {
+                            if project_replace_focus_on_replace {
+                                let restored = if is_redo {
+                                    project_replace_with_history
+                                        .redo(&project_replace_with, project_replace_with.len())
+                                } else {
+                                    project_replace_with_history
+                                        .undo(&project_replace_with, project_replace_with.len())
+                                };
+                                if let Some((t, _)) = restored {
+                                    project_replace_with = t;
+                                }
+                            } else {
+                                let restored = if is_redo {
+                                    project_replace_search_history
+                                        .redo(&project_replace_search, project_replace_search.len())
+                                } else {
+                                    project_replace_search_history
+                                        .undo(&project_replace_search, project_replace_search.len())
+                                };
+                                if let Some((t, _)) = restored {
+                                    project_replace_search = t;
+                                    project_replace_results = run_project_search(
+                                        &project_replace_search,
+                                        &project_root,
+                                        project_use_regex,
+                                        project_whole_word,
+                                        project_case_insensitive,
+                                    );
+                                    project_replace_selected = 0;
+                                }
+                            }
+                            redraw = true;
+                            continue;
+                        }
+                        if let Some(action) = keymap_field_clipboard(&keymap, key.as_str(), mods) {
+                            match action {
+                                FieldClipboard::Copy => {
+                                    let src = if project_replace_focus_on_replace {
+                                        &project_replace_with
+                                    } else {
+                                        &project_replace_search
+                                    };
+                                    if !src.is_empty() {
+                                        crate::window::set_clipboard_text(src);
+                                    }
+                                }
+                                FieldClipboard::Cut => {
+                                    if project_replace_focus_on_replace {
+                                        if !project_replace_with.is_empty() {
+                                            crate::window::set_clipboard_text(
+                                                &project_replace_with,
+                                            );
+                                            project_replace_with_history.record(
+                                                &project_replace_with,
+                                                project_replace_with.len(),
+                                                FieldEdit::Replace,
+                                                buffer::now_secs(),
+                                            );
+                                            project_replace_with.clear();
+                                        }
+                                    } else if !project_replace_search.is_empty() {
+                                        crate::window::set_clipboard_text(&project_replace_search);
+                                        project_replace_search_history.record(
+                                            &project_replace_search,
+                                            project_replace_search.len(),
+                                            FieldEdit::Replace,
+                                            buffer::now_secs(),
+                                        );
+                                        project_replace_search.clear();
+                                        project_replace_results = run_project_search(
+                                            &project_replace_search,
+                                            &project_root,
+                                            project_use_regex,
+                                            project_whole_word,
+                                            project_case_insensitive,
+                                        );
+                                        project_replace_selected = 0;
+                                    }
+                                }
+                                FieldClipboard::Paste => {
+                                    if let Some(clip) = crate::window::get_clipboard_text() {
+                                        if project_replace_focus_on_replace {
+                                            project_replace_with_history.record(
+                                                &project_replace_with,
+                                                project_replace_with.len(),
+                                                FieldEdit::Replace,
+                                                buffer::now_secs(),
+                                            );
+                                            append_clipboard_line(&mut project_replace_with, &clip);
+                                        } else {
+                                            project_replace_search_history.record(
+                                                &project_replace_search,
+                                                project_replace_search.len(),
+                                                FieldEdit::Replace,
+                                                buffer::now_secs(),
+                                            );
+                                            append_clipboard_line(
+                                                &mut project_replace_search,
+                                                &clip,
+                                            );
+                                            project_replace_results = run_project_search(
+                                                &project_replace_search,
+                                                &project_root,
+                                                project_use_regex,
+                                                project_whole_word,
+                                                project_case_insensitive,
+                                            );
+                                            project_replace_selected = 0;
+                                        }
+                                    }
+                                }
+                            }
+                            redraw = true;
+                            continue;
                         }
                         match key.as_str() {
                             "escape" => {
@@ -3042,8 +3520,24 @@ pub fn run(
                                 }
                             "backspace" => {
                                 if project_replace_focus_on_replace {
+                                    if !project_replace_with.is_empty() {
+                                        project_replace_with_history.record(
+                                            &project_replace_with,
+                                            project_replace_with.len(),
+                                            FieldEdit::Delete,
+                                            buffer::now_secs(),
+                                        );
+                                    }
                                     project_replace_with.pop();
                                 } else {
+                                    if !project_replace_search.is_empty() {
+                                        project_replace_search_history.record(
+                                            &project_replace_search,
+                                            project_replace_search.len(),
+                                            FieldEdit::Delete,
+                                            buffer::now_secs(),
+                                        );
+                                    }
                                     project_replace_search.pop();
                                     project_replace_results = run_project_search(
                                         &project_replace_search,
@@ -3725,6 +4219,64 @@ pub fn run(
 
                     // Command palette intercepts keys when active.
                     if palette_active {
+                        if let Some(is_redo) = keymap_field_undo(&keymap, key.as_str(), mods) {
+                            let restored = if is_redo {
+                                palette_history.redo(&palette_query, palette_query.len())
+                            } else {
+                                palette_history.undo(&palette_query, palette_query.len())
+                            };
+                            if let Some((t, _)) = restored {
+                                palette_query = t;
+                                palette_results =
+                                    fuzzy_filter_commands(&palette_query, &all_commands);
+                                palette_selected =
+                                    palette_selected.min(palette_results.len().saturating_sub(1));
+                            }
+                            redraw = true;
+                            continue;
+                        }
+                        if let Some(action) = keymap_field_clipboard(&keymap, key.as_str(), mods) {
+                            match action {
+                                FieldClipboard::Copy => {
+                                    if !palette_query.is_empty() {
+                                        crate::window::set_clipboard_text(&palette_query);
+                                    }
+                                }
+                                FieldClipboard::Cut => {
+                                    if !palette_query.is_empty() {
+                                        crate::window::set_clipboard_text(&palette_query);
+                                        palette_history.record(
+                                            &palette_query,
+                                            palette_query.len(),
+                                            FieldEdit::Replace,
+                                            buffer::now_secs(),
+                                        );
+                                        palette_query.clear();
+                                        palette_results =
+                                            fuzzy_filter_commands(&palette_query, &all_commands);
+                                        palette_selected = palette_selected
+                                            .min(palette_results.len().saturating_sub(1));
+                                    }
+                                }
+                                FieldClipboard::Paste => {
+                                    if let Some(clip) = crate::window::get_clipboard_text() {
+                                        palette_history.record(
+                                            &palette_query,
+                                            palette_query.len(),
+                                            FieldEdit::Replace,
+                                            buffer::now_secs(),
+                                        );
+                                        append_clipboard_line(&mut palette_query, &clip);
+                                        palette_results =
+                                            fuzzy_filter_commands(&palette_query, &all_commands);
+                                        palette_selected = palette_selected
+                                            .min(palette_results.len().saturating_sub(1));
+                                    }
+                                }
+                            }
+                            redraw = true;
+                            continue;
+                        }
                         match key.as_str() {
                             "escape" => {
                                 palette_active = false;
@@ -3760,6 +4312,14 @@ pub fn run(
                                 continue;
                             }
                             "backspace" => {
+                                if !palette_query.is_empty() {
+                                    palette_history.record(
+                                        &palette_query,
+                                        palette_query.len(),
+                                        FieldEdit::Delete,
+                                        buffer::now_secs(),
+                                    );
+                                }
                                 palette_query.pop();
                             }
                             "up" => {
@@ -3849,6 +4409,173 @@ pub fn run(
                                 redraw = true;
                                 continue;
                             }
+                        }
+                        if let Some(is_redo) = keymap_field_undo(&keymap, key.as_str(), mods) {
+                            // Route the undo/redo bindings to the focused field
+                            // instead of letting them leak through to the document.
+                            if find_focus_on_replace {
+                                let restored = if is_redo {
+                                    replace_history.redo(&replace_query, replace_query.len())
+                                } else {
+                                    replace_history.undo(&replace_query, replace_query.len())
+                                };
+                                if let Some((t, _)) = restored {
+                                    replace_query = t;
+                                }
+                            } else {
+                                let restored = if is_redo {
+                                    find_history.redo(&find_query, find_query.len())
+                                } else {
+                                    find_history.undo(&find_query, find_query.len())
+                                };
+                                if let Some((t, _)) = restored {
+                                    find_query = t;
+                                    if let Some(doc) = docs.get_mut(active_tab) {
+                                        let dv = &mut doc.view;
+                                        let sel = if find_in_selection {
+                                            find_selection_range
+                                        } else {
+                                            None
+                                        };
+                                        find_matches = compute_find_matches_filtered(
+                                            dv,
+                                            &find_query,
+                                            find_use_regex,
+                                            find_whole_word,
+                                            find_case_insensitive,
+                                            sel,
+                                        );
+                                        find_current = find_match_at_or_after(
+                                            &find_matches,
+                                            find_anchor.0,
+                                            find_anchor.1,
+                                        );
+                                        if let Some(i) = find_current {
+                                            select_find_match(dv, find_matches[i], replace_active);
+                                        }
+                                    }
+                                }
+                            }
+                            redraw = true;
+                            continue;
+                        }
+                        if let Some(action) = keymap_field_clipboard(&keymap, key.as_str(), mods) {
+                            // Clipboard ops belong to the find bar while it holds
+                            // focus, not the document.
+                            match action {
+                                FieldClipboard::Copy => {
+                                    let src = if find_focus_on_replace {
+                                        &replace_query
+                                    } else {
+                                        &find_query
+                                    };
+                                    if !src.is_empty() {
+                                        crate::window::set_clipboard_text(src);
+                                    }
+                                }
+                                FieldClipboard::Cut => {
+                                    if find_focus_on_replace {
+                                        if !replace_query.is_empty() {
+                                            crate::window::set_clipboard_text(&replace_query);
+                                            replace_history.record(
+                                                &replace_query,
+                                                replace_query.len(),
+                                                FieldEdit::Replace,
+                                                buffer::now_secs(),
+                                            );
+                                            replace_query.clear();
+                                        }
+                                    } else if !find_query.is_empty() {
+                                        crate::window::set_clipboard_text(&find_query);
+                                        find_history.record(
+                                            &find_query,
+                                            find_query.len(),
+                                            FieldEdit::Replace,
+                                            buffer::now_secs(),
+                                        );
+                                        find_query.clear();
+                                        if let Some(doc) = docs.get_mut(active_tab) {
+                                            let dv = &mut doc.view;
+                                            let sel = if find_in_selection {
+                                                find_selection_range
+                                            } else {
+                                                None
+                                            };
+                                            find_matches = compute_find_matches_filtered(
+                                                dv,
+                                                &find_query,
+                                                find_use_regex,
+                                                find_whole_word,
+                                                find_case_insensitive,
+                                                sel,
+                                            );
+                                            find_current = find_match_at_or_after(
+                                                &find_matches,
+                                                find_anchor.0,
+                                                find_anchor.1,
+                                            );
+                                            if let Some(i) = find_current {
+                                                select_find_match(
+                                                    dv,
+                                                    find_matches[i],
+                                                    replace_active,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                FieldClipboard::Paste => {
+                                    if let Some(clip) = crate::window::get_clipboard_text() {
+                                        if find_focus_on_replace {
+                                            replace_history.record(
+                                                &replace_query,
+                                                replace_query.len(),
+                                                FieldEdit::Replace,
+                                                buffer::now_secs(),
+                                            );
+                                            append_clipboard_line(&mut replace_query, &clip);
+                                        } else {
+                                            find_history.record(
+                                                &find_query,
+                                                find_query.len(),
+                                                FieldEdit::Replace,
+                                                buffer::now_secs(),
+                                            );
+                                            append_clipboard_line(&mut find_query, &clip);
+                                            if let Some(doc) = docs.get_mut(active_tab) {
+                                                let dv = &mut doc.view;
+                                                let sel = if find_in_selection {
+                                                    find_selection_range
+                                                } else {
+                                                    None
+                                                };
+                                                find_matches = compute_find_matches_filtered(
+                                                    dv,
+                                                    &find_query,
+                                                    find_use_regex,
+                                                    find_whole_word,
+                                                    find_case_insensitive,
+                                                    sel,
+                                                );
+                                                find_current = find_match_at_or_after(
+                                                    &find_matches,
+                                                    find_anchor.0,
+                                                    find_anchor.1,
+                                                );
+                                                if let Some(i) = find_current {
+                                                    select_find_match(
+                                                        dv,
+                                                        find_matches[i],
+                                                        replace_active,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            redraw = true;
+                            continue;
                         }
                         match key.as_str() {
                             "escape" => {
@@ -4052,8 +4779,24 @@ pub fn run(
                             }
                             "backspace" => {
                                 if find_focus_on_replace {
+                                    if !replace_query.is_empty() {
+                                        replace_history.record(
+                                            &replace_query,
+                                            replace_query.len(),
+                                            FieldEdit::Delete,
+                                            buffer::now_secs(),
+                                        );
+                                    }
                                     replace_query.pop();
                                 } else {
+                                    if !find_query.is_empty() {
+                                        find_history.record(
+                                            &find_query,
+                                            find_query.len(),
+                                            FieldEdit::Delete,
+                                            buffer::now_secs(),
+                                        );
+                                    }
                                     find_query.pop();
                                     if let Some(doc) = docs.get_mut(active_tab) {
                                         let dv = &mut doc.view;
@@ -4084,10 +4827,9 @@ pub fn run(
                                 continue;
                             }
                             _ => {
-                                // Unhandled keys (Home, End, Ctrl+C / X / V,
-                                // arrow keys, page up/down, etc.) fall through
-                                // to the main keymap dispatch so doc navigation
-                                // and clipboard shortcuts keep working while
+                                // Unhandled keys (Home, End, arrow keys, page
+                                // up/down, etc.) fall through to the main keymap
+                                // dispatch so doc navigation keeps working while
                                 // the find bar is visible. Bare letters reach
                                 // the keymap with no binding and become no-ops;
                                 // the paired TextInput event still appends them
@@ -4241,6 +4983,12 @@ pub fn run(
                     }
                     // Route typing into the Note Anvil sidebar search when focused.
                     if subsystems.has_notes_mode() && notes_search_focused {
+                        notes_search_history.record(
+                            &notes_search,
+                            notes_search.len(),
+                            FieldEdit::Insert,
+                            buffer::now_secs(),
+                        );
                         notes_search.push_str(text);
                         redraw = true;
                         continue;
@@ -4257,6 +5005,12 @@ pub fn run(
                     }
                     // Route typed characters into the inline new-file input.
                     if sidebar_new_file_dir.is_some() {
+                        sidebar_new_file_history.record(
+                            &sidebar_new_file_name,
+                            sidebar_new_file_cursor,
+                            FieldEdit::Insert,
+                            buffer::now_secs(),
+                        );
                         sidebar_new_file_name.insert_str(sidebar_new_file_cursor, text);
                         sidebar_new_file_cursor += text.len();
                         redraw = true;
@@ -4270,6 +5024,12 @@ pub fn run(
                             || cmdview_mode == CmdViewMode::Rename)
                     {
                         let prev_text = cmdview_text.clone();
+                        cmdview_history.record(
+                            &cmdview_text,
+                            cmdview_cursor,
+                            FieldEdit::Insert,
+                            buffer::now_secs(),
+                        );
                         // Insert at the caret rather than appending so left/right/home/end
                         // editing is preserved while typing.
                         cmdview_text.insert_str(cmdview_cursor, text);
@@ -4332,6 +5092,12 @@ pub fn run(
                         continue;
                     }
                     if subsystems.has_find_in_files() && project_search_active {
+                        project_search_history.record(
+                            &project_search_query,
+                            project_search_query.len(),
+                            FieldEdit::Insert,
+                            buffer::now_secs(),
+                        );
                         project_search_query.push_str(text);
                         project_search_results = run_project_search(
                             &project_search_query,
@@ -4346,8 +5112,20 @@ pub fn run(
                     }
                     if subsystems.has_find_in_files() && project_replace_active {
                         if project_replace_focus_on_replace {
+                            project_replace_with_history.record(
+                                &project_replace_with,
+                                project_replace_with.len(),
+                                FieldEdit::Insert,
+                                buffer::now_secs(),
+                            );
                             project_replace_with.push_str(text);
                         } else {
+                            project_replace_search_history.record(
+                                &project_replace_search,
+                                project_replace_search.len(),
+                                FieldEdit::Insert,
+                                buffer::now_secs(),
+                            );
                             project_replace_search.push_str(text);
                             project_replace_results = run_project_search(
                                 &project_replace_search,
@@ -4362,6 +5140,12 @@ pub fn run(
                         continue;
                     }
                     if palette_active {
+                        palette_history.record(
+                            &palette_query,
+                            palette_query.len(),
+                            FieldEdit::Insert,
+                            buffer::now_secs(),
+                        );
                         palette_query.push_str(text);
                         palette_results = fuzzy_filter_commands(&palette_query, &all_commands);
                         palette_selected = 0;
@@ -4376,8 +5160,20 @@ pub fn run(
                     }
                     if find_active {
                         if find_focus_on_replace {
+                            replace_history.record(
+                                &replace_query,
+                                replace_query.len(),
+                                FieldEdit::Insert,
+                                buffer::now_secs(),
+                            );
                             replace_query.push_str(text);
                         } else {
+                            find_history.record(
+                                &find_query,
+                                find_query.len(),
+                                FieldEdit::Insert,
+                                buffer::now_secs(),
+                            );
                             find_query.push_str(text);
                             if let Some(doc) = docs.get_mut(active_tab) {
                                 let dv = &mut doc.view;
@@ -11089,6 +11885,71 @@ fn build_find_regex(
     crate::editor::regex::NativeRegex::compile(&pat, flags).ok()
 }
 
+/// Map a keystroke to a dialog-input undo/redo action via the keymap, so the
+/// bindings the user configured for `doc:undo` / `doc:redo` drive the focused
+/// dialog field too. Returns `Some(true)` when the key is bound to `doc:redo`,
+/// `Some(false)` for `doc:undo`, and `None` for anything else.
+fn keymap_field_undo(
+    keymap: &NativeKeymap,
+    key: &str,
+    mods: crate::editor::event::Modifiers,
+) -> Option<bool> {
+    keymap.commands_for(key, mods).and_then(|cmds| {
+        if cmds.iter().any(|c| c == "doc:redo") {
+            Some(true)
+        } else if cmds.iter().any(|c| c == "doc:undo") {
+            Some(false)
+        } else {
+            None
+        }
+    })
+}
+
+/// A clipboard action resolved from the keymap for a focused dialog input.
+#[derive(Clone, Copy)]
+enum FieldClipboard {
+    Copy,
+    Cut,
+    Paste,
+}
+
+/// Map a keystroke to a dialog-input clipboard action via the keymap, so the
+/// bindings the user configured for `doc:copy` / `doc:cut` / `doc:paste` drive
+/// the focused dialog field too. Returns `None` for anything else.
+fn keymap_field_clipboard(
+    keymap: &NativeKeymap,
+    key: &str,
+    mods: crate::editor::event::Modifiers,
+) -> Option<FieldClipboard> {
+    keymap.commands_for(key, mods).and_then(|cmds| {
+        if cmds.iter().any(|c| c == "doc:paste") {
+            Some(FieldClipboard::Paste)
+        } else if cmds.iter().any(|c| c == "doc:cut") {
+            Some(FieldClipboard::Cut)
+        } else if cmds.iter().any(|c| c == "doc:copy") {
+            Some(FieldClipboard::Copy)
+        } else {
+            None
+        }
+    })
+}
+
+/// Append clipboard text onto a single-line input buffer, dropping line breaks
+/// so a multi-line paste collapses onto one line instead of corrupting a search
+/// query. Used by the append-only find/replace, project-search, palette, and
+/// notes inputs, none of which model more than one line.
+fn append_clipboard_line(buf: &mut String, clip: &str) {
+    buf.extend(clip.chars().filter(|&c| c != '\n' && c != '\r'));
+}
+
+/// Insert clipboard text into a caret-tracked single-line input at byte offset
+/// `cursor`, dropping line breaks. Returns the caret position after the text.
+fn insert_clipboard_line(buf: &mut String, cursor: usize, clip: &str) -> usize {
+    let line: String = clip.chars().filter(|&c| c != '\n' && c != '\r').collect();
+    buf.insert_str(cursor, &line);
+    cursor + line.len()
+}
+
 /// Scan the document and return every match as (line, col, end_line, end_col).
 /// All values are 1-based. Matches may span newlines; a match consuming a
 /// line's trailing `\n` ends at column 1 of the next line.
@@ -12730,5 +13591,56 @@ mod indent_tests {
     #[test]
     fn smart_backspace_skips_col_one() {
         assert_eq!(smart_backspace_span("    ", 1, "soft", 4), None);
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::{append_clipboard_line, insert_clipboard_line};
+
+    #[test]
+    fn append_clipboard_line_appends_plain_text() {
+        let mut buf = String::from("foo");
+        append_clipboard_line(&mut buf, "bar");
+        assert_eq!(buf, "foobar");
+    }
+
+    #[test]
+    fn append_clipboard_line_strips_line_breaks() {
+        let mut buf = String::new();
+        append_clipboard_line(&mut buf, "a\r\nb\nc");
+        assert_eq!(buf, "abc");
+    }
+
+    #[test]
+    fn append_clipboard_line_keeps_tabs_and_unicode() {
+        let mut buf = String::new();
+        append_clipboard_line(&mut buf, "a\tπ");
+        assert_eq!(buf, "a\tπ");
+    }
+
+    #[test]
+    fn insert_clipboard_line_inserts_at_caret_and_returns_offset() {
+        let mut buf = String::from("ac");
+        let caret = insert_clipboard_line(&mut buf, 1, "b");
+        assert_eq!(buf, "abc");
+        assert_eq!(caret, 2);
+    }
+
+    #[test]
+    fn insert_clipboard_line_advances_caret_past_multibyte() {
+        let mut buf = String::from("xy");
+        let caret = insert_clipboard_line(&mut buf, 1, "é");
+        assert_eq!(buf, "xéy");
+        // 'é' is two bytes in UTF-8, so the caret moves from 1 to 3.
+        assert_eq!(caret, 3);
+    }
+
+    #[test]
+    fn insert_clipboard_line_strips_line_breaks_before_inserting() {
+        let mut buf = String::from("[]");
+        let caret = insert_clipboard_line(&mut buf, 1, "a\nb");
+        assert_eq!(buf, "[ab]");
+        assert_eq!(caret, 3);
     }
 }
