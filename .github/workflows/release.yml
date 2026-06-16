@@ -216,18 +216,18 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}
+          # Key the build cache on the static-CRT toolchain config so a target/
+          # built against a different MSVC runtime is not restored; the -crt2-
+          # token keeps the loose restore-keys fallback on the same runtime too.
+          key: ${{ runner.os }}-${{ github.job }}-crt2-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml', 'cmake/static-crt.cmake') }}
           restore-keys: |
-            ${{ runner.os }}-${{ github.job }}-
+            ${{ runner.os }}-${{ github.job }}-crt2-
 
+      # SDL3's CMake build is pointed at the static MSVC runtime via
+      # cmake/static-crt.cmake, wired in .cargo/config.toml so the static
+      # C runtime matches Rust's +crt-static for both this release build
+      # and the debug test build.
       - name: Build
-        env:
-          # Force the CMake-based SDL3 build (and any other cmake-rs
-          # consumer in the graph) to link against the static MSVC
-          # runtime so the final exe has no VCRUNTIME140.dll /
-          # MSVCP140.dll import. Rust is already +crt-static via
-          # `.cargo/config.toml`; this aligns the C half of the build.
-          CMAKE_MSVC_RUNTIME_LIBRARY: MultiThreaded
         run: cargo build --release --workspace
 
       - name: Stage installer payload

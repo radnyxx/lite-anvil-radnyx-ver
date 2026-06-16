@@ -82,9 +82,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}
+          # Key the build cache on the static-CRT toolchain config so a target/
+          # built against a different MSVC runtime is not restored; the -crt2-
+          # token keeps the loose restore-keys fallback on the same runtime too.
+          key: ${{ runner.os }}-${{ github.job }}-crt2-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml', 'cmake/static-crt.cmake') }}
           restore-keys: |
-            ${{ runner.os }}-${{ github.job }}-
+            ${{ runner.os }}-${{ github.job }}-crt2-
 
       - name: Run tests
         shell: pwsh

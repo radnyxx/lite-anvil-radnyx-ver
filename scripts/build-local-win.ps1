@@ -31,7 +31,8 @@ $DistDir = Join-Path $RootDir 'dist'
 $StageDir = Join-Path $DistDir $ArchiveBase
 $Archive = Join-Path $DistDir "$ArchiveBase.zip"
 
-$env:CMAKE_MSVC_RUNTIME_LIBRARY = 'MultiThreaded'
+# SDL3's static MSVC runtime alignment with Rust's +crt-static is configured
+# in .cargo/config.toml (cmake/static-crt.cmake); no per-build env needed.
 cargo build --release --workspace
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

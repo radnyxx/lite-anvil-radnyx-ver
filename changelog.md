@@ -9,6 +9,7 @@
 * Faster drawing: glyph-width measurement no longer copies each glyph bitmap, the glyph cache evicts least-recently-used entries (no more thrash with mixed CJK/Latin text), and redundant per-frame text-width remeasurement is cached.
 * Child processes (shells, language servers, helpers) now exit with the editor instead of lingering as orphans, and terminals are reaped even while the panel is hidden.
 * Dependencies: bundled SDL 3.4.4 -> 3.4.10, migrated to the maintained `freetype-sys` and `png` 0.18, replaced `once_cell` with the standard library, plus routine version bumps.
+* Fixed the Windows MSVC build: SDL 3.4.10's CMake build now links the static CRT to match Rust's `+crt-static`, instead of the dynamic runtime that broke linking with unresolved `__imp_*` symbols. A CMake toolchain file (`cmake/static-crt.cmake`) sets `CMAKE_MSVC_RUNTIME_LIBRARY` via `.cargo/config.toml`, so debug, release, and test builds all link statically.
 
 ## [2.12.0] - 2026-06-15 -- Clipboard and undo/redo shortcuts work inside find/replace and other dialog inputs.
 
