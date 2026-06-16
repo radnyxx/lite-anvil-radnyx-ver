@@ -60,6 +60,10 @@ impl NativeRegex {
     pub fn compile(pattern: &str, flags: CompileFlags) -> Result<Self, RegexError> {
         let mut b = RegexBuilder::new();
         b.utf(true).ucp(true);
+        // JIT-compile the pattern so whole-document scans (find-as-you-type)
+        // run native rather than interpreted. `jit_if_available` falls back to
+        // the interpreter on platforms without a PCRE2 JIT backend.
+        b.jit_if_available(true);
         if flags.caseless {
             b.caseless(true);
         }
@@ -140,6 +144,7 @@ impl NativeRegex {
             re: self,
             subject,
             pos: start,
+            locs: self.inner.capture_locations(),
         }
     }
 
@@ -184,7 +189,7 @@ impl NativeRegex {
                 Err(e) => return Err(RegexError::Match(e.to_string())),
             }
         }
-        result.extend_from_slice(&subject[pos..]);
+        result.extend_from_slice(&subject[pos.min(subject.len())..]);
         Ok((result, count))
     }
 }
@@ -194,6 +199,7 @@ pub struct FindIter<'a> {
     re: &'a NativeRegex,
     subject: &'a [u8],
     pos: usize,
+    locs: CaptureLocations,
 }
 
 /// A single match with its capture groups (0-based byte spans).
@@ -222,18 +228,17 @@ impl Iterator for FindIter<'_> {
         if self.pos > self.subject.len() {
             return None;
         }
-        let mut locs = self.re.inner.capture_locations();
         match self
             .re
             .inner
-            .captures_read_at(&mut locs, self.subject, self.pos)
+            .captures_read_at(&mut self.locs, self.subject, self.pos)
         {
             Ok(Some(m)) => {
                 let ms = m.start();
                 let me = m.end();
                 self.pos = if me == ms { me + 1 } else { me };
                 let n = self.re.inner.captures_len() + 1;
-                let groups = (0..n).map(|i| locs.get(i)).collect();
+                let groups = (0..n).map(|i| self.locs.get(i)).collect();
                 Some(Ok(Match { groups }))
             }
             Ok(None) => None,

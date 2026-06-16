@@ -1375,6 +1375,8 @@ pub fn run(
     let mut git_status_active = false;
     let mut git_status_entries: Vec<(String, String, String)> = Vec::new();
     let mut git_status_selected: usize = 0;
+    // Background git-status refresh job, polled each frame.
+    let mut git_status_job: Option<std::thread::JoinHandle<Vec<(String, String, String)>>> = None;
 
     // Git blame: per-line annotations shown inline at the right edge.
     let mut git_blame_active = false;
@@ -1508,19 +1510,20 @@ pub fn run(
     let mut project_replace_with = String::new();
     let mut project_replace_focus_on_replace = false;
     let mut project_replace_results: Vec<(String, usize, String)> = Vec::new();
+    // Background project-wide replace-all (sed) job, polled each frame.
+    let mut replace_job: Option<std::thread::JoinHandle<usize>> = None;
     let mut project_replace_selected: usize = 0;
 
     /// Run grep across the project, returning (path, line_number, line_text) tuples.
-    fn run_project_search(
+    /// Blocking project-wide grep. Runs on a worker thread spawned by
+    /// `run_project_search`; do not call directly from the render loop.
+    fn project_search_blocking(
         query: &str,
         root: &str,
         use_regex: bool,
         whole_word: bool,
         case_insensitive: bool,
     ) -> Vec<(String, usize, String)> {
-        if query.len() < 2 {
-            return Vec::new();
-        }
         let mut args = vec!["-rn".to_string()];
         if case_insensitive {
             args.push("-i".to_string());
@@ -1570,6 +1573,72 @@ pub fn run(
             results.push((path.to_string(), line_num, text.trim().to_string()));
         }
         results
+    }
+
+    /// Non-blocking project-wide search. Returns the most recently completed
+    /// results immediately and runs grep on a worker thread, so typing in the
+    /// find box never blocks the render loop; the per-frame pump applies fresh
+    /// results for the active panel when they land.
+    fn run_project_search(
+        query: &str,
+        root: &str,
+        use_regex: bool,
+        whole_word: bool,
+        case_insensitive: bool,
+    ) -> Vec<(String, usize, String)> {
+        type Hit = (String, usize, String);
+        type Key = (String, String, bool, bool, bool);
+        struct SearchCache {
+            ready: std::collections::HashMap<Key, Vec<Hit>>,
+            order: std::collections::VecDeque<Key>,
+            inflight: std::collections::HashSet<Key>,
+            most_recent: Vec<Hit>,
+        }
+        if query.len() < 2 {
+            return Vec::new();
+        }
+        static CACHE: std::sync::LazyLock<parking_lot::Mutex<SearchCache>> =
+            std::sync::LazyLock::new(|| {
+                parking_lot::Mutex::new(SearchCache {
+                    ready: std::collections::HashMap::new(),
+                    order: std::collections::VecDeque::new(),
+                    inflight: std::collections::HashSet::new(),
+                    most_recent: Vec::new(),
+                })
+            });
+        let key: Key = (
+            query.to_string(),
+            root.to_string(),
+            use_regex,
+            whole_word,
+            case_insensitive,
+        );
+        let mut cache = CACHE.lock();
+        if let Some(v) = cache.ready.get(&key) {
+            return v.clone();
+        }
+        // First request for this query: kick a background grep. The closure
+        // publishes its result only if the query is still wanted, and the
+        // cache is bounded so long sessions of typing cannot grow it.
+        if cache.inflight.insert(key.clone()) {
+            let job_key = key.clone();
+            std::thread::spawn(move || {
+                let val = project_search_blocking(
+                    &job_key.0, &job_key.1, job_key.2, job_key.3, job_key.4,
+                );
+                let mut cache = CACHE.lock();
+                cache.inflight.remove(&job_key);
+                cache.most_recent = val.clone();
+                cache.ready.insert(job_key.clone(), val);
+                cache.order.push_back(job_key);
+                while cache.order.len() > 64 {
+                    if let Some(old) = cache.order.pop_front() {
+                        cache.ready.remove(&old);
+                    }
+                }
+            });
+        }
+        cache.most_recent.clone()
     }
 
     /// Execute project-wide find-and-replace using sed. Returns the number of
@@ -1788,6 +1857,7 @@ pub fn run(
                     lsp::send_message(tid, &lsp_initialize_request(req_id, &lsp_state.root_uri));
             }
             Err(e) => {
+                lsp_state.note_spawn_failure();
                 log_to_file(userdir, &format!("Failed to spawn LSP: {e}"));
                 if verbose {
                     eprintln!("Failed to spawn LSP: {e}");
@@ -3469,33 +3539,22 @@ pub fn run(
                             "return" | "keypad enter" if mods.ctrl
                                 // Execute replace all.
                                 && !project_replace_search.is_empty() => {
-                                    let count = execute_project_replace(
-                                        &project_root,
-                                        &project_replace_search,
-                                        &project_replace_with,
-                                    );
-                                    project_replace_active = false;
-                                    info_message = Some((
-                                        format!("Replaced {count} occurrences across project"),
-                                        Instant::now(),
-                                    ));
-                                    // Reload any open files that may have changed.
-                                    for doc in &mut docs {
-                                        if let Some(buf_id) = doc.view.buffer_id {
-                                            if !doc.path.is_empty() {
-                                                let _ = buffer::with_buffer_mut(buf_id, |b| {
-                                                    let mut fresh = buffer::default_buffer_state();
-                                                    if buffer::load_file(&mut fresh, &doc.path)
-                                                        .is_ok()
-                                                    {
-                                                        b.lines = fresh.lines;
-                                                        b.change_id += 1;
-                                                    }
-                                                    Ok(())
-                                                });
-                                            }
-                                        }
+                                    // Run the project-wide sed on a worker
+                                    // thread; its count and the doc reload are
+                                    // applied from the per-frame poll.
+                                    if replace_job.is_none() {
+                                        let root = project_root.clone();
+                                        let search = project_replace_search.clone();
+                                        let with = project_replace_with.clone();
+                                        replace_job = Some(std::thread::spawn(move || {
+                                            execute_project_replace(&root, &search, &with)
+                                        }));
+                                        info_message = Some((
+                                            "Replacing across project...".to_string(),
+                                            Instant::now(),
+                                        ));
                                     }
+                                    project_replace_active = false;
                                 }
                             "return" | "keypad enter"
                                 // Preview: run search to show matches.
@@ -3593,7 +3652,11 @@ pub fn run(
                                     (git_status_selected + 1).min(git_status_entries.len() - 1);
                             }
                             "r" | "R" => {
-                                git_status_entries = run_git_status(&project_root);
+                                if git_status_job.is_none() {
+                                    let root = project_root.clone();
+                                    git_status_job =
+                                        Some(std::thread::spawn(move || run_git_status(&root)));
+                                }
                                 git_status_selected = 0;
                             }
                             _ => {}
@@ -4096,8 +4159,9 @@ pub fn run(
                                                 Instant::now(),
                                             ));
                                             if !is_save_as && subsystems.has_git() {
-                                                doc.git_changes =
-                                                    crate::editor::git::diff_file(&save_path);
+                                                // Diff off the UI thread; the
+                                                // gutter fills in via drain_diffs.
+                                                crate::editor::git::start_diff(&save_path);
                                             }
                                         } else {
                                             info_message = Some((
@@ -7409,6 +7473,7 @@ pub fn run(
         // LSP: auto-start for the active file if no transport is running.
         if subsystems.has_lsp()
             && lsp_state.transport_id.is_none()
+            && lsp_state.should_attempt_spawn()
             && let Some(doc) = docs.get(active_tab)
             && !doc.path.is_empty()
         {
@@ -7563,6 +7628,7 @@ pub fn run(
                             {
                                 lsp_state.pending_requests.remove(&id);
                                 lsp_state.initialized = true;
+                                lsp_state.note_spawn_success();
                                 // Send initialized notification.
                                 let _ = lsp::send_message(
                                     tid,
@@ -8073,6 +8139,8 @@ pub fn run(
                         }
                     }
                     if !poll.running {
+                        lsp::remove_transport(tid);
+                        lsp_state.note_spawn_failure();
                         lsp_state.transport_id = None;
                         lsp_state.initialized = false;
                     }
@@ -8199,8 +8267,11 @@ pub fn run(
             }
         }
 
-        // Terminal: poll output from each pty.
-        if subsystems.has_terminal() && terminal.visible {
+        // Terminal: poll/drain/reap every pty each frame regardless of panel
+        // visibility, so a shell that exits or floods output while the panel
+        // is hidden is still reaped and its pty kept drained. Only repaints
+        // are gated on visibility.
+        if subsystems.has_terminal() {
             let mut dead_indices = Vec::new();
             for (i, inst) in terminal.terminals.iter_mut().enumerate() {
                 inst.inner.poll();
@@ -8210,25 +8281,141 @@ pub fn run(
                     && !data.is_empty()
                 {
                     inst.tbuf.process_output(&data);
-                    redraw = true;
+                    if terminal.visible {
+                        redraw = true;
+                    }
                 }
             }
             // Remove dead terminals in reverse order.
             for i in dead_indices.into_iter().rev() {
                 terminal.terminals[i].inner.cleanup();
                 terminal.terminals.remove(i);
-                redraw = true;
+                if terminal.visible {
+                    redraw = true;
+                }
             }
             if terminal.terminals.is_empty() {
+                let was_visible = terminal.visible;
                 terminal.visible = false;
                 terminal.focused = false;
                 terminal.active = 0;
-                // Panel just went away -- force a native repaint so the
-                // editor content reclaims the vacated strip in the
-                // same frame instead of waiting for the next event.
-                crate::window::force_invalidate();
+                if was_visible {
+                    // Panel just went away -- force a native repaint so the
+                    // editor content reclaims the vacated strip in the
+                    // same frame instead of waiting for the next event.
+                    crate::window::force_invalidate();
+                }
             } else if terminal.active >= terminal.terminals.len() {
                 terminal.active = terminal.terminals.len() - 1;
+            }
+        }
+
+        // Git: surface results of async mutations (push/pull/commit/stash) and
+        // apply async diff results to their docs. These run on worker threads,
+        // so the render loop never blocks on git network or fork/exec I/O.
+        for m in crate::editor::git::drain_finished_mutations() {
+            let detail = m.result.stderr.trim();
+            let msg = if m.result.ok {
+                format!("{}: done", m.label)
+            } else if !detail.is_empty() {
+                format!("{}: {detail}", m.label)
+            } else {
+                format!("{} failed", m.label)
+            };
+            info_message = Some((msg, Instant::now()));
+            // A mutation can change the working-tree baseline, so refresh the
+            // diff gutters of the open docs against the new git state.
+            for doc in &docs {
+                if !doc.path.is_empty() {
+                    crate::editor::git::start_diff(&doc.path);
+                }
+            }
+            redraw = true;
+        }
+        for d in crate::editor::git::drain_diffs() {
+            if let Some(doc) = docs.iter_mut().find(|doc| doc.path == d.path) {
+                doc.git_changes = d.changes;
+                redraw = true;
+            }
+        }
+
+        // Project search/replace: pick up async grep results for the active
+        // panel. run_project_search is non-blocking and refreshes in the
+        // background; apply the latest results when they differ.
+        if subsystems.has_find_in_files() {
+            if project_search_active {
+                let r = run_project_search(
+                    &project_search_query,
+                    &project_root,
+                    project_use_regex,
+                    project_whole_word,
+                    project_case_insensitive,
+                );
+                if r != project_search_results {
+                    project_search_results = r;
+                    if project_search_selected >= project_search_results.len() {
+                        project_search_selected = project_search_results.len().saturating_sub(1);
+                    }
+                    redraw = true;
+                }
+            }
+            if project_replace_active {
+                let r = run_project_search(
+                    &project_replace_search,
+                    &project_root,
+                    project_use_regex,
+                    project_whole_word,
+                    project_case_insensitive,
+                );
+                if r != project_replace_results {
+                    project_replace_results = r;
+                    if project_replace_selected >= project_replace_results.len() {
+                        project_replace_selected = project_replace_results.len().saturating_sub(1);
+                    }
+                    redraw = true;
+                }
+            }
+        }
+
+        // Project replace-all: apply the result of the background sed job.
+        if let Some(job) = replace_job.take() {
+            if job.is_finished() {
+                let count = job.join().unwrap_or(0);
+                info_message = Some((
+                    format!("Replaced {count} occurrences across project"),
+                    Instant::now(),
+                ));
+                // Reload any open files the replace may have changed.
+                for doc in &mut docs {
+                    if let Some(buf_id) = doc.view.buffer_id {
+                        if !doc.path.is_empty() {
+                            let _ = buffer::with_buffer_mut(buf_id, |b| {
+                                let mut fresh = buffer::default_buffer_state();
+                                if buffer::load_file(&mut fresh, &doc.path).is_ok() {
+                                    b.lines = fresh.lines;
+                                    b.change_id += 1;
+                                }
+                                Ok(())
+                            });
+                        }
+                    }
+                }
+                redraw = true;
+            } else {
+                replace_job = Some(job);
+            }
+        }
+
+        // Git status panel: apply the result of the background refresh.
+        if let Some(job) = git_status_job.take() {
+            if job.is_finished() {
+                git_status_entries = job.join().unwrap_or_default();
+                if git_status_selected >= git_status_entries.len() {
+                    git_status_selected = git_status_entries.len().saturating_sub(1);
+                }
+                redraw = true;
+            } else {
+                git_status_job = Some(job);
             }
         }
 
@@ -11804,11 +11991,8 @@ pub fn run(
         inst.inner.cleanup();
     }
 
-    // Shut down LSP transport.
-    if let Some(tid) = lsp_state.transport_id {
-        lsp::terminate_transport(tid);
-        lsp::remove_transport(tid);
-    }
+    // Shut down every LSP transport (kill + reap, closing writer threads).
+    lsp::clear_all_transports();
 
     false
 }
@@ -11966,7 +12150,13 @@ fn compute_find_matches(
     let Some(buf_id) = dv.buffer_id else {
         return Vec::new();
     };
-    buffer::with_buffer(buf_id, |b| Ok(buffer::regex_find_all(&b.lines, &re))).unwrap_or_default()
+    // Reuse the memoized subject across keystrokes, then run the scan without
+    // holding the buffer lock.
+    let Ok(subject) = buffer::with_buffer_mut(buf_id, |b| Ok(buffer::search_subject_cached(b)))
+    else {
+        return Vec::new();
+    };
+    subject.find_all(&re)
 }
 
 /// Like `compute_find_matches` but optionally restricts results to the lines

@@ -208,11 +208,12 @@ pub(crate) fn open_file_into(path: &str, docs: &mut Vec<OpenDoc>, use_git: bool)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string());
-    let git_changes = if use_git {
-        crate::editor::git::diff_file(path)
-    } else {
-        HashMap::new()
-    };
+    if use_git {
+        // The gutter starts empty and is filled when main_loop applies the result
+        // from git::drain_diffs, so a large repo never stalls the file open.
+        crate::editor::git::start_diff(path);
+    }
+    let git_changes = HashMap::new();
     let saved_sig =
         buffer::with_buffer(buf_id, |b| Ok(buffer::content_signature(&b.lines))).unwrap_or(0);
     docs.push(OpenDoc {

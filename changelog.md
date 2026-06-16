@@ -1,5 +1,15 @@
 # Change Log
 
+## [2.12.1] - 2026-06-16 -- Crash, stability, and responsiveness hardening; dependency refresh.
+
+* Fixed three editor-killing crashes reachable from untrusted input (with `panic = "abort"` each lost unsaved work): a negative 256-color terminal escape (`\x1b[38;5;-1m`), a malformed or oversized LSP `Content-Length` header, and a "replace all" with an empty-matchable pattern (`.*`, `\s*`, `$`). Also hardened a stale-selection out-of-bounds in cut/paste/case-change and a UTF-8 boundary slice in regex replace.
+* The editor no longer freezes on git or search I/O. Project-wide find/replace (grep/sed), git push/pull/commit/stash, per-open/save diffs, and the git-status refresh now run on background threads and apply their results when ready. A misconfigured language server can no longer respawn every frame, and sending a large file change to a busy server no longer blocks input.
+* Typing in the find bar stays responsive on large files. In-document search now uses a JIT-compiled matcher, caches the joined document text between keystrokes, reuses one match buffer, and maps match positions without per-match allocation or UTF-8 recounting on ASCII files.
+* Undo/redo no longer serializes the whole document to JSON on every edit; it records compact inverse edits, so typing and undo stay fast on large files and the undo history reaches much further back.
+* Faster drawing: glyph-width measurement no longer copies each glyph bitmap, the glyph cache evicts least-recently-used entries (no more thrash with mixed CJK/Latin text), and redundant per-frame text-width remeasurement is cached.
+* Child processes (shells, language servers, helpers) now exit with the editor instead of lingering as orphans, and terminals are reaped even while the panel is hidden.
+* Dependencies: bundled SDL 3.4.4 -> 3.4.10, migrated to the maintained `freetype-sys` and `png` 0.18, replaced `once_cell` with the standard library, plus routine version bumps.
+
 ## [2.12.0] - 2026-06-15 -- Clipboard and undo/redo shortcuts work inside find/replace and other dialog inputs.
 
 * Added cut, copy, paste, undo, redo to find/replace bar, command palette, file picker, etc.

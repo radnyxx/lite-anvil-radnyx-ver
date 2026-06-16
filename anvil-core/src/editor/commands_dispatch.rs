@@ -32,12 +32,20 @@ match cmd.as_str() {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            // SAFETY: setsid has no preconditions beyond "called in the
-            // child after fork"; the closure runs there.
+            // Double-fork: the child we spawn forks the real new window as a
+            // grandchild and exits at once. The grandchild reparents to
+            // init/launchd and is reaped there, so it never lingers as a zombie
+            // of this editor even if the new window outlives or predeceases us.
+            // setsid on the grandchild detaches it from the controlling terminal.
+            // SAFETY: only fork/setsid/_exit run post-fork, all async-signal-safe.
             unsafe {
-                cmd.pre_exec(|| {
-                    libc::setsid();
-                    Ok(())
+                cmd.pre_exec(|| match libc::fork() {
+                    -1 => Err(std::io::Error::last_os_error()),
+                    0 => {
+                        libc::setsid();
+                        Ok(())
+                    }
+                    _ => libc::_exit(0),
                 });
             }
         }
@@ -48,8 +56,20 @@ match cmd.as_str() {
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
             cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
         }
-        if let Err(e) = cmd.spawn() {
-            log_to_file(userdir, &format!("core:new-window spawn failed: {e}"));
+        match cmd.spawn() {
+            Ok(child) => {
+                // On unix the spawned child is the intermediate fork, which exits
+                // immediately; waiting on it reaps it at once. On other platforms
+                // the detached child manages its own lifetime, so just release it.
+                #[cfg(unix)]
+                {
+                    let mut child = child;
+                    let _ = child.wait();
+                }
+                #[cfg(not(unix))]
+                drop(child);
+            }
+            Err(e) => log_to_file(userdir, &format!("core:new-window spawn failed: {e}")),
         }
     }
 }
@@ -768,7 +788,9 @@ match cmd.as_str() {
                 }
                 log_to_file(userdir, &format!("Saved {path}"));
                 if subsystems.has_git() {
-                    doc.git_changes = crate::editor::git::diff_file(&path);
+                    // Off the UI thread: the gutter is filled in when main_loop
+                    // applies the result from git::drain_diffs by matching path.
+                    crate::editor::git::start_diff(&path);
                 }
                 if subsystems.has_lsp() {
                     let save_ext = path.rsplit('.').next().unwrap_or("");
@@ -1018,18 +1040,26 @@ match cmd.as_str() {
 }
 "git:pull" | "git:push" | "git:commit" | "git:stash" => {
     if subsystems.has_git() {
-        let git_cmd = match cmd.as_str() {
-            "git:pull" => vec!["pull"],
-            "git:push" => vec!["push"],
-            "git:commit" => vec!["commit", "--allow-empty-message", "-m", ""],
-            "git:stash" => vec!["stash"],
-            _ => vec![],
+        // pull/push reach the network and can stall on an unreachable remote, so
+        // run every mutation on a git worker thread. main_loop picks up the result
+        // each frame via git::drain_finished_mutations and refreshes the status.
+        let (label, git_cmd): (&str, Vec<String>) = match cmd.as_str() {
+            "git:pull" => ("git pull", vec!["pull".into()]),
+            "git:push" => ("git push", vec!["push".into()]),
+            "git:commit" => (
+                "git commit",
+                vec![
+                    "commit".into(),
+                    "--allow-empty-message".into(),
+                    "-m".into(),
+                    String::new(),
+                ],
+            ),
+            "git:stash" => ("git stash", vec!["stash".into()]),
+            _ => ("", Vec::new()),
         };
         if !git_cmd.is_empty() {
-            let _ = std::process::Command::new("git")
-                .arg("-C").arg(&project_root)
-                .args(&git_cmd)
-                .output();
+            crate::editor::git::start_mutation(&project_root, label, &git_cmd);
         }
     }
 }

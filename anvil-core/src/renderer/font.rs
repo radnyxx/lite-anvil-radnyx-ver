@@ -1,8 +1,9 @@
-use freetype::freetype::{
+use freetype_sys::{
     FT_Done_Face, FT_FACE_FLAG_SCALABLE, FT_Get_Char_Index, FT_GlyphSlot, FT_Init_FreeType,
-    FT_Int32, FT_LOAD_FORCE_AUTOHINT, FT_LOAD_NO_HINTING, FT_Library, FT_Load_Char, FT_Load_Glyph,
-    FT_New_Face, FT_Render_Glyph, FT_Render_Mode, FT_Render_Mode_::*, FT_Set_Pixel_Sizes, FT_UInt,
-    FT_ULong,
+    FT_Int32, FT_LOAD_FORCE_AUTOHINT, FT_LOAD_NO_HINTING, FT_LOAD_TARGET_LCD, FT_LOAD_TARGET_LIGHT,
+    FT_LOAD_TARGET_MONO, FT_Library, FT_Load_Char, FT_Load_Glyph, FT_New_Face, FT_RENDER_MODE_LCD,
+    FT_RENDER_MODE_LIGHT, FT_RENDER_MODE_MONO, FT_RENDER_MODE_NORMAL, FT_Render_Glyph,
+    FT_Render_Mode, FT_Set_Pixel_Sizes, FT_UInt, FT_ULong,
 };
 use parking_lot::Mutex;
 use std::cell::Cell;
@@ -36,12 +37,9 @@ pub(super) fn ft_lib() -> Result<FT_Library, String> {
     })
 }
 
-// ── Load flags not exported by the freetype 0.7.2 crate ──────────────────────
+// ── Load flag not exported by the freetype-sys crate ─────────────────────────
 
 const FT_LOAD_BITMAP_METRICS_ONLY: i32 = 1 << 22;
-const FT_LOAD_TARGET_LIGHT: i32 = 1 << 16;
-const FT_LOAD_TARGET_MONO: i32 = 2 << 16;
-const FT_LOAD_TARGET_LCD: i32 = 3 << 16;
 
 // pixel_mode constants (FT_Pixel_Mode_ variants as u8 values)
 const PIXEL_MODE_GRAY: u8 = 2;
@@ -124,13 +122,22 @@ pub enum Hinting {
 // ── Glyph data ────────────────────────────────────────────────────────────────
 
 /// Cached per-glyph data.
+///
+/// The bitmap lives behind an `Arc` so cloning a `GlyphInfo` for the draw
+/// path is a refcount bump rather than a copy of the pixel buffer.
 #[derive(Clone)]
 pub struct GlyphInfo {
     pub xadvance: f32,
-    pub bitmap: Option<GlyphBitmap>,
+    pub bitmap: Option<Arc<GlyphBitmap>>,
     /// False when the font has no cmap entry for the codepoint and this
     /// glyph is the face's .notdef box. Font-group fallback keys off this.
     pub defined: bool,
+}
+
+/// A cached glyph together with the access tick used for LRU eviction.
+struct CachedGlyph {
+    info: GlyphInfo,
+    last_used: u64,
 }
 
 /// Raw pixel data for a rendered glyph.
@@ -161,7 +168,10 @@ pub struct FontInner {
     pub space_advance: f32,
     pub antialiasing: Antialiasing,
     pub hinting: Hinting,
-    glyphs: HashMap<u32, GlyphInfo>,
+    glyphs: HashMap<u32, CachedGlyph>,
+    /// Monotonic access counter; each glyph records the tick of its last
+    /// use so the least-recently-used entry can be evicted at capacity.
+    tick: u64,
 }
 
 // FT_Face is a C raw pointer. We run single-threaded so this is safe.
@@ -191,7 +201,7 @@ impl FontInner {
         hinting: Hinting,
     ) -> Result<Self, String> {
         let c_path = CString::new(path).map_err(|e| e.to_string())?;
-        let mut face: *mut freetype::freetype::FT_FaceRec_ = std::ptr::null_mut();
+        let mut face: *mut freetype_sys::FT_FaceRec = std::ptr::null_mut();
         // SAFETY: library is valid; path is a valid C string.
         let lib = ft_lib()?;
         let err = unsafe { FT_New_Face(lib, c_path.as_ptr(), 0, &mut face) };
@@ -210,13 +220,14 @@ impl FontInner {
             antialiasing,
             hinting,
             glyphs: HashMap::new(),
+            tick: 0,
         };
         inner.recompute_metrics()?;
         inner.prewarm_ascii();
         Ok(inner)
     }
 
-    fn raw_face(&self) -> *mut freetype::freetype::FT_FaceRec_ {
+    fn raw_face(&self) -> *mut freetype_sys::FT_FaceRec {
         self.face as *mut _
     }
 
@@ -244,7 +255,7 @@ impl FontInner {
         }
         // Space advance — load without hinting for accurate measurement.
         // SAFETY: face is valid after FT_Set_Pixel_Sizes; glyph slot is valid after successful load.
-        let flags = (FT_LOAD_BITMAP_METRICS_ONLY | FT_LOAD_NO_HINTING as i32) as FT_Int32;
+        let flags = (FT_LOAD_BITMAP_METRICS_ONLY | FT_LOAD_NO_HINTING) as FT_Int32;
         if unsafe { FT_Load_Char(face, b' ' as FT_ULong, flags) } == 0 {
             self.space_advance = unsafe { (*(*face).glyph).advance.x as f32 / 64.0 };
         }
@@ -255,15 +266,13 @@ impl FontInner {
     fn load_render_flags(&self) -> (FT_Int32, FT_Render_Mode) {
         match (self.antialiasing, self.hinting) {
             (Antialiasing::None, _) => (FT_LOAD_TARGET_MONO, FT_RENDER_MODE_MONO),
-            (Antialiasing::Grayscale, Hinting::None) => {
-                (FT_LOAD_NO_HINTING as i32, FT_RENDER_MODE_NORMAL)
-            }
+            (Antialiasing::Grayscale, Hinting::None) => (FT_LOAD_NO_HINTING, FT_RENDER_MODE_NORMAL),
             (Antialiasing::Grayscale, _) => (
-                FT_LOAD_TARGET_LIGHT | FT_LOAD_FORCE_AUTOHINT as i32,
+                FT_LOAD_TARGET_LIGHT | FT_LOAD_FORCE_AUTOHINT,
                 FT_RENDER_MODE_LIGHT,
             ),
             (Antialiasing::Subpixel, _) => (
-                FT_LOAD_TARGET_LCD | FT_LOAD_FORCE_AUTOHINT as i32,
+                FT_LOAD_TARGET_LCD | FT_LOAD_FORCE_AUTOHINT,
                 FT_RENDER_MODE_LCD,
             ),
         }
@@ -276,22 +285,60 @@ impl FontInner {
         }
         for cp in 32..=126u32 {
             if !self.glyphs.contains_key(&cp) {
-                let glyph = self.load_glyph(cp);
-                self.glyphs.insert(cp, glyph);
+                self.tick = self.tick.wrapping_add(1);
+                let last_used = self.tick;
+                let info = self.load_glyph(cp);
+                self.glyphs.insert(cp, CachedGlyph { info, last_used });
             }
         }
     }
 
     pub fn get_glyph(&mut self, codepoint: u32) -> &GlyphInfo {
-        if !self.glyphs.contains_key(&codepoint) {
+        self.tick = self.tick.wrapping_add(1);
+        let now = self.tick;
+        if let Some(cached) = self.glyphs.get_mut(&codepoint) {
+            cached.last_used = now;
+        } else {
             if self.glyphs.len() >= glyph_cache_limit() {
-                // Keep printable ASCII (always hot), evict everything else.
-                self.glyphs.retain(|&cp, _| (32..=126).contains(&cp));
+                self.evict_lru();
             }
-            self.glyphs.insert(codepoint, self.load_glyph(codepoint));
+            let info = self.load_glyph(codepoint);
+            self.glyphs.insert(
+                codepoint,
+                CachedGlyph {
+                    info,
+                    last_used: now,
+                },
+            );
         }
-        // SAFETY: insert above guarantees the key exists.
-        &self.glyphs[&codepoint]
+        // SAFETY: the branch above guarantees the key exists.
+        &self.glyphs[&codepoint].info
+    }
+
+    /// Pixel advance of `codepoint`, rasterising and caching the glyph as
+    /// needed but returning only the advance - the bitmap is never cloned.
+    pub fn glyph_advance(&mut self, codepoint: u32) -> f32 {
+        self.get_glyph(codepoint).xadvance
+    }
+
+    /// Drop the least-recently-used glyph, preferring non-ASCII so the
+    /// printable-ASCII working set stays resident as a floor.
+    fn evict_lru(&mut self) {
+        let victim = self
+            .glyphs
+            .iter()
+            .filter(|&(&cp, _)| !(32..=126).contains(&cp))
+            .min_by_key(|(_, c)| c.last_used)
+            .map(|(&cp, _)| cp);
+        let victim = victim.or_else(|| {
+            self.glyphs
+                .iter()
+                .min_by_key(|(_, c)| c.last_used)
+                .map(|(&cp, _)| cp)
+        });
+        if let Some(cp) = victim {
+            self.glyphs.remove(&cp);
+        }
     }
 
     fn load_glyph(&self, codepoint: u32) -> GlyphInfo {
@@ -309,7 +356,7 @@ impl FontInner {
         let defined = glyph_id != 0;
 
         // Load without hinting to get the accurate xadvance.
-        let no_hint = (FT_LOAD_BITMAP_METRICS_ONLY | FT_LOAD_NO_HINTING as i32) as FT_Int32;
+        let no_hint = (FT_LOAD_BITMAP_METRICS_ONLY | FT_LOAD_NO_HINTING) as FT_Int32;
         let xadvance = if unsafe { FT_Load_Glyph(face, glyph_id, no_hint) } == 0 {
             unsafe { (*(*face).glyph).advance.x as f32 / 64.0 }
         } else {
@@ -342,7 +389,7 @@ impl FontInner {
         let bitmap = unsafe { copy_glyph_bitmap((*face).glyph) };
         GlyphInfo {
             xadvance,
-            bitmap,
+            bitmap: bitmap.map(Arc::new),
             defined,
         }
     }
@@ -357,13 +404,16 @@ unsafe fn copy_glyph_bitmap(slot: FT_GlyphSlot) -> Option<GlyphBitmap> {
         if bm.width == 0 || bm.rows == 0 || bm.buffer.is_null() {
             return None;
         }
-        let subpixel = bm.pixel_mode == PIXEL_MODE_LCD;
-        let gray = bm.pixel_mode == PIXEL_MODE_GRAY;
+        // FT_Pixel_Mode values are small and non-negative; comparing as u8
+        // is correct whether the platform's c_char is signed or unsigned.
+        let subpixel = bm.pixel_mode as u8 == PIXEL_MODE_LCD;
+        let gray = bm.pixel_mode as u8 == PIXEL_MODE_GRAY;
         if !subpixel && !gray {
             return None; // unsupported mode
         }
-        let pixel_width = if subpixel { bm.width / 3 } else { bm.width };
-        let row_bytes = bm.width; // bytes per row (3*pixel_width for LCD)
+        let width = bm.width as u32;
+        let pixel_width = if subpixel { width / 3 } else { width };
+        let row_bytes = width; // bytes per row (3*pixel_width for LCD)
         let total = bm.rows as usize * bm.pitch.unsigned_abs() as usize;
         let mut data = Vec::with_capacity(total);
         for row in 0..bm.rows as isize {
@@ -376,7 +426,7 @@ unsafe fn copy_glyph_bitmap(slot: FT_GlyphSlot) -> Option<GlyphBitmap> {
         Some(GlyphBitmap {
             data,
             width: pixel_width,
-            rows: bm.rows,
+            rows: bm.rows as u32,
             row_bytes,
             left: (*slot).bitmap_left,
             top: (*slot).bitmap_top,
@@ -398,3 +448,62 @@ pub fn is_whitespace(cp: u32) -> bool {
 // ── RenFont ──────────────────────────────────────────────────────────────────
 
 pub type FontRef = Arc<Mutex<FontInner>>;
+
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+
+    fn load_inner() -> FontInner {
+        let path = format!(
+            "{}/../data/fonts/Lilex-Regular.ttf",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        FontInner::load(&path, 15.0, Antialiasing::Grayscale, Hinting::Slight)
+            .expect("bundled font loads")
+    }
+
+    #[test]
+    fn glyph_advance_matches_full_glyph() {
+        let mut font = load_inner();
+        let full = font.get_glyph('M' as u32).xadvance;
+        assert_eq!(font.glyph_advance('M' as u32), full);
+    }
+
+    #[test]
+    fn lru_evicts_only_least_recently_used() {
+        set_skip_prewarm(true);
+        set_glyph_cache_limit(8);
+        let mut font = load_inner();
+        let hot = 0x4E00u32;
+        font.get_glyph(hot);
+        for cp in 0x4E01..0x4E40u32 {
+            font.get_glyph(cp);
+            // Keep `hot` the most-recently-used so LRU never evicts it.
+            font.get_glyph(hot);
+        }
+        assert!(
+            font.glyphs.contains_key(&hot),
+            "recently-used glyph stays resident under LRU"
+        );
+        assert!(
+            font.glyphs.len() <= 8,
+            "cache respects the configured limit"
+        );
+        set_glyph_cache_limit(2048);
+        set_skip_prewarm(false);
+    }
+
+    #[test]
+    fn ascii_is_pinned_against_eviction() {
+        set_glyph_cache_limit(128);
+        let mut font = load_inner();
+        for cp in 0x4E00..0x4F00u32 {
+            font.get_glyph(cp);
+        }
+        assert!(
+            font.glyphs.contains_key(&('A' as u32)),
+            "printable ASCII stays pinned as the eviction floor"
+        );
+        set_glyph_cache_limit(2048);
+    }
+}

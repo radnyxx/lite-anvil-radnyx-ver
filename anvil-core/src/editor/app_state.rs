@@ -1,9 +1,9 @@
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use std::sync::LazyLock;
 
 // ── Clip rect stack ─────────────────────────────────────────────────────────
 
-static CLIP_STACK: Lazy<Mutex<Vec<[f64; 4]>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static CLIP_STACK: LazyLock<Mutex<Vec<[f64; 4]>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Initialize the clip stack with a full-screen rect.
 pub fn clip_init(w: f64, h: f64) {

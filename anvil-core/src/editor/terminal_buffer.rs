@@ -486,6 +486,9 @@ impl TerminalBufferInner {
     }
 
     fn ansi_color_256(&self, idx: i64) -> [u8; 4] {
+        if !(0..=255).contains(&idx) {
+            return self.default_fg;
+        }
         if (0..16).contains(&idx) {
             return self.palette[idx as usize];
         }

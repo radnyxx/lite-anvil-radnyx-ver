@@ -9,8 +9,12 @@ use std::sync::{
 };
 use std::thread;
 
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use std::sync::LazyLock;
+
+/// Largest LSP frame body accepted. Bounds buffer growth and rejects a
+/// corrupt or hostile Content-Length before it is used as a slice bound.
+const MAX_LSP_FRAME: usize = 64 << 20;
 
 // ── Protocol framing ─────────────────────────────────────────────────────────
 
@@ -38,8 +42,13 @@ pub fn decode_messages(buffer: &str) -> Result<(Vec<Value>, String), String> {
         }) else {
             return Err("invalid LSP message without Content-Length".to_string());
         };
+        if content_length > MAX_LSP_FRAME {
+            return Err("LSP Content-Length exceeds frame cap".to_string());
+        }
         let body_start = header_end + 4;
-        let body_end = body_start + content_length;
+        let Some(body_end) = body_start.checked_add(content_length) else {
+            return Err("LSP Content-Length overflow".to_string());
+        };
         if remaining.len() < body_end {
             break;
         }
@@ -79,15 +88,19 @@ pub fn completion_kinds() -> HashMap<i64, &'static str> {
 /// Handle to a running LSP server process.
 pub struct TransportHandle {
     pub child: Child,
-    pub stdin: ChildStdin,
+    /// Framed messages bound for the server's stdin. The dedicated writer
+    /// thread owns the pipe and drains this channel, so senders never block
+    /// the UI thread on a full pipe buffer. Dropping the handle closes the
+    /// channel, which stops the writer thread.
+    pub writer: Sender<Vec<u8>>,
     pub messages: Receiver<Value>,
     pub stderr: Receiver<String>,
     pub exit_code: Arc<AtomicU64>,
 }
 
-static TRANSPORTS: Lazy<Mutex<HashMap<u64, TransportHandle>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static NEXT_ID: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
+static TRANSPORTS: LazyLock<Mutex<HashMap<u64, TransportHandle>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_ID: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(1));
 
 fn next_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
@@ -109,8 +122,15 @@ pub fn parse_messages(buffer: &mut Vec<u8>, sender: &Sender<Value>) {
             buffer.clear();
             break;
         };
+        if length > MAX_LSP_FRAME {
+            buffer.clear();
+            break;
+        }
         let body_start = header_end + 4;
-        let body_end = body_start + length;
+        let Some(body_end) = body_start.checked_add(length) else {
+            buffer.clear();
+            break;
+        };
         if buffer.len() < body_end {
             break;
         }
@@ -157,6 +177,61 @@ fn start_stderr_thread(mut stderr: ChildStderr, sender: Sender<String>) {
     });
 }
 
+fn start_writer_thread(mut stdin: ChildStdin, receiver: Receiver<Vec<u8>>) {
+    thread::spawn(move || {
+        while let Ok(frame) = receiver.recv() {
+            if stdin.write_all(&frame).and_then(|_| stdin.flush()).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Set up the spawned LSP server so it does not outlive this editor process.
+#[cfg(target_os = "linux")]
+fn configure_child_lifetime(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: pre_exec runs in the forked child before exec; prctl is
+    // async-signal-safe. PR_SET_PDEATHSIG delivers SIGTERM to this child
+    // when the editor process dies, so an orphaned server is reaped.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGTERM as libc::c_ulong,
+                0,
+                0,
+                0,
+            ) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Set up the spawned LSP server so it can be killed as a group.
+#[cfg(target_os = "macos")]
+fn configure_child_lifetime(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: pre_exec runs in the forked child before exec; setsid is
+    // async-signal-safe. A fresh session/process-group lets the editor
+    // group-kill the server instead of leaving it orphaned (macOS has no
+    // PR_SET_PDEATHSIG equivalent).
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn configure_child_lifetime(_cmd: &mut Command) {}
+
 /// Spawn an LSP server process and register a transport.
 pub fn spawn_transport(
     command: &[String],
@@ -175,6 +250,7 @@ pub fn spawn_transport(
     for (key, value) in env {
         cmd.env(key, value);
     }
+    configure_child_lifetime(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
     let stdin = child.stdin.take().ok_or("missing LSP stdin")?;
     let stdout = child.stdout.take().ok_or("missing LSP stdout")?;
@@ -182,15 +258,17 @@ pub fn spawn_transport(
 
     let (msg_tx, msg_rx) = unbounded();
     let (err_tx, err_rx) = unbounded();
+    let (writer_tx, writer_rx) = unbounded();
     start_stdout_thread(stdout, msg_tx);
     start_stderr_thread(stderr, err_tx);
+    start_writer_thread(stdin, writer_rx);
 
     let id = next_id();
     TRANSPORTS.lock().insert(
         id,
         TransportHandle {
             child,
-            stdin,
+            writer: writer_tx,
             messages: msg_rx,
             stderr: err_rx,
             exit_code: Arc::new(AtomicU64::new(u64::MAX)),
@@ -202,15 +280,17 @@ pub fn spawn_transport(
 /// Send an LSP message (JSON value) to a transport.
 pub fn send_message(id: u64, value: &Value) -> Result<(), String> {
     let payload = serde_json::to_vec(value).map_err(|e| e.to_string())?;
-    let framed = format!("Content-Length: {}\r\n\r\n", payload.len()).into_bytes();
-    let mut transports = TRANSPORTS.lock();
-    let handle = transports.get_mut(&id).ok_or("unknown LSP transport")?;
-    handle
-        .stdin
-        .write_all(&framed)
-        .and_then(|_| handle.stdin.write_all(&payload))
-        .and_then(|_| handle.stdin.flush())
-        .map_err(|e| e.to_string())
+    let mut frame = format!("Content-Length: {}\r\n\r\n", payload.len()).into_bytes();
+    frame.extend_from_slice(&payload);
+    let writer = {
+        let transports = TRANSPORTS.lock();
+        transports
+            .get(&id)
+            .ok_or("unknown LSP transport")?
+            .writer
+            .clone()
+    };
+    writer.send(frame).map_err(|e| e.to_string())
 }
 
 /// Poll result from a transport.
@@ -265,33 +345,46 @@ pub fn poll_transport(id: u64, max_messages: usize) -> Result<PollResult, String
     })
 }
 
-/// Terminate a transport's child process.
+/// Terminate a transport's child process, reaping it so no zombie remains.
 pub fn terminate_transport(id: u64) -> bool {
     if let Some(handle) = TRANSPORTS.lock().get_mut(&id) {
         if let Err(e) = handle.child.kill() {
             log::warn!("failed to kill LSP transport {id}: {e}");
         }
+        let _ = handle.child.wait();
         true
     } else {
         false
     }
 }
 
-/// Remove a transport.
+/// Remove a transport, closing its writer channel and reaping the child.
 pub fn remove_transport(id: u64) -> bool {
-    TRANSPORTS.lock().remove(&id).is_some()
+    let handle = TRANSPORTS.lock().remove(&id);
+    if let Some(mut handle) = handle {
+        // The child may already have exited; kill is best-effort.
+        let _ = handle.child.kill();
+        let _ = handle.child.wait();
+        // Dropping `handle` closes the writer Sender, stopping the writer thread.
+        true
+    } else {
+        false
+    }
 }
 
-/// Terminate and remove all transports.
+/// Terminate every transport, reaping each child and closing its writer thread.
 pub fn clear_all_transports() {
-    let mut transports = TRANSPORTS.lock();
-    for handle in transports.values_mut() {
+    let handles: Vec<TransportHandle> = {
+        let mut transports = TRANSPORTS.lock();
+        transports.drain().map(|(_, handle)| handle).collect()
+    };
+    for mut handle in handles {
         if let Err(e) = handle.child.kill() {
             log::warn!("failed to kill LSP transport: {e}");
         }
+        let _ = handle.child.wait();
+        // Each `handle` drops here, closing its writer Sender so the thread exits.
     }
-    transports.clear();
-    transports.shrink_to_fit();
 }
 
 // ── Manager data types ───────────────────────────────────────────────────────
@@ -489,6 +582,41 @@ mod tests {
         let (messages, remaining) = decode_messages(partial).unwrap();
         assert!(messages.is_empty());
         assert!(!remaining.is_empty());
+    }
+
+    #[test]
+    fn decode_messages_rejects_oversized_content_length() {
+        let buffer = "Content-Length: 999999999\r\n\r\n{}";
+        assert!(decode_messages(buffer).is_err());
+    }
+
+    #[test]
+    fn parse_messages_clears_buffer_on_oversized_content_length() {
+        let (tx, rx) = unbounded();
+        let mut buffer = b"Content-Length: 999999999\r\n\r\n{}".to_vec();
+        parse_messages(&mut buffer, &tx);
+        assert!(buffer.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn parse_messages_handles_max_content_length_without_panic() {
+        let (tx, rx) = unbounded();
+        let header = format!("Content-Length: {}\r\n\r\n", usize::MAX);
+        let mut buffer = header.into_bytes();
+        parse_messages(&mut buffer, &tx);
+        assert!(buffer.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn parse_messages_decodes_valid_frame() {
+        let (tx, rx) = unbounded();
+        let value = serde_json::json!({"id": 1});
+        let mut buffer = encode_message(&value).unwrap().into_bytes();
+        parse_messages(&mut buffer, &tx);
+        assert_eq!(rx.try_recv().unwrap()["id"], 1);
+        assert!(buffer.is_empty());
     }
 
     #[test]

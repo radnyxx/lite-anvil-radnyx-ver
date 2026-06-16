@@ -1,10 +1,10 @@
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── Status cache ─────────────────────────────────────────────────────────────
@@ -41,7 +41,7 @@ impl StatusCache {
     }
 }
 
-static STATUS_CACHE: Lazy<Mutex<StatusCache>> = Lazy::new(|| {
+static STATUS_CACHE: LazyLock<Mutex<StatusCache>> = LazyLock::new(|| {
     Mutex::new(StatusCache {
         map: HashMap::new(),
         order: VecDeque::new(),
@@ -115,14 +115,14 @@ pub struct CommandResult {
 
 // ── Global state ─────────────────────────────────────────────────────────────
 
-pub static REPOS: Lazy<Mutex<HashMap<String, RepoState>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-pub static PATH_ROOTS: Lazy<Mutex<HashMap<String, Option<String>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-pub static PENDING: Lazy<Mutex<VecDeque<(String, RefreshOutcome)>>> =
-    Lazy::new(|| Mutex::new(VecDeque::new()));
-pub static COMMANDS: Lazy<Mutex<HashMap<u64, Option<CommandResult>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+pub static REPOS: LazyLock<Mutex<HashMap<String, RepoState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+pub static PATH_ROOTS: LazyLock<Mutex<HashMap<String, Option<String>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+pub static PENDING: LazyLock<Mutex<VecDeque<(String, RefreshOutcome)>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
+pub static COMMANDS: LazyLock<Mutex<HashMap<u64, Option<CommandResult>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 pub static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
 // ── Pure functions ───────────────────────────────────────────────────────────
@@ -134,7 +134,7 @@ pub fn normalize(path: &str) -> String {
 
 /// Monotonic seconds since first call.
 pub fn monotonic_secs() -> f64 {
-    static START: Lazy<std::time::Instant> = Lazy::new(std::time::Instant::now);
+    static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
     START.elapsed().as_secs_f64()
 }
 
@@ -390,6 +390,10 @@ pub fn start_command(root: &str, args: &[String]) -> u64 {
     let args: Vec<String> = args.to_vec();
     std::thread::spawn(move || {
         let mut cmd = Command::new("git");
+        // No controlling terminal exists for a GUI editor, so disable interactive
+        // credential prompts: an unauthenticated fetch/push fails fast instead of
+        // blocking the worker thread on an askpass prompt that can never be answered.
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
         cmd.arg("-C").arg(&root);
         for arg in &args {
             cmd.arg(arg);
@@ -425,6 +429,52 @@ pub fn check_command(handle: u64) -> Option<CommandResult> {
             Some(val)
         }
     }
+}
+
+/// In-flight git mutation: its poll handle plus the metadata to surface its result.
+struct PendingMutation {
+    handle: u64,
+    label: String,
+    root: String,
+}
+
+/// A completed git mutation, ready to surface as a status message and trigger a refresh.
+pub struct FinishedMutation {
+    pub label: String,
+    pub root: String,
+    pub result: CommandResult,
+}
+
+static PENDING_MUTATIONS: LazyLock<Mutex<Vec<PendingMutation>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Start a git mutation (pull/push/commit/stash) on a worker thread; `label` names it for reporting.
+pub fn start_mutation(root: &str, label: &str, args: &[String]) -> u64 {
+    let handle = start_command(root, args);
+    PENDING_MUTATIONS.lock().push(PendingMutation {
+        handle,
+        label: label.to_string(),
+        root: root.to_string(),
+    });
+    handle
+}
+
+/// Drain git mutations that have finished since the last call; the caller surfaces each result.
+pub fn drain_finished_mutations() -> Vec<FinishedMutation> {
+    let mut pending = PENDING_MUTATIONS.lock();
+    let mut finished = Vec::new();
+    pending.retain(|m| match check_command(m.handle) {
+        Some(result) => {
+            finished.push(FinishedMutation {
+                label: m.label.clone(),
+                root: m.root.clone(),
+                result,
+            });
+            false
+        }
+        None => true,
+    });
+    finished
 }
 
 /// List branches for a repo root.
@@ -515,6 +565,28 @@ fn parse_hunk_range(s: &str) -> (usize, usize) {
     } else {
         (1, s.parse().unwrap_or(1))
     }
+}
+
+/// A completed async diff: per-line changes keyed by the file path that was requested.
+pub struct DiffResult {
+    pub path: String,
+    pub changes: HashMap<usize, LineChange>,
+}
+
+static PENDING_DIFFS: LazyLock<Mutex<Vec<DiffResult>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Compute a file's per-line git diff on a worker thread; collect it later via `drain_diffs`.
+pub fn start_diff(file_path: &str) {
+    let path = file_path.to_string();
+    std::thread::spawn(move || {
+        let changes = diff_file(&path);
+        PENDING_DIFFS.lock().push(DiffResult { path, changes });
+    });
+}
+
+/// Drain async diffs that have finished; the caller applies each to its doc by matching `path`.
+pub fn drain_diffs() -> Vec<DiffResult> {
+    std::mem::take(&mut *PENDING_DIFFS.lock())
 }
 
 /// Get cached status signature for change detection.

@@ -30,6 +30,12 @@ pub struct DocView {
     pub show_whitespace: bool,
     /// Bookmarked lines (1-based, kept sorted).
     pub bookmarks: Vec<usize>,
+    /// Per-frame text-measurement cache for `draw_native`, mutated through a
+    /// shared reference while drawing. Invalidated by the same inputs that
+    /// rebuild `cached_render` (buffer change, scroll, view size, font), so
+    /// the widest-line and per-row column geometry are measured once per
+    /// frame instead of remeasured for the scrollbar, selections, and cursor.
+    width_cache: std::cell::RefCell<WidthCache>,
 }
 
 impl DocView {
@@ -49,6 +55,7 @@ impl DocView {
             folds: Vec::new(),
             show_whitespace: false,
             bookmarks: Vec::new(),
+            width_cache: std::cell::RefCell::new(WidthCache::default()),
         }
     }
 }
@@ -134,7 +141,123 @@ pub struct SelectionRange {
     pub col2: usize,
 }
 
+/// Cached text measurements for one `draw_native` frame, valid while `key`
+/// matches the current frame inputs.
+#[derive(Debug, Default)]
+struct WidthCache {
+    key: Option<WidthKey>,
+    /// Widest visible rendered line in pixels (drives the horizontal
+    /// scrollbar); `None` until measured for the current key.
+    max_line_w: Option<f64>,
+    /// Per visual row (indexed by position in the `lines` slice) the
+    /// cumulative pixel offset of every buffer-column boundary. An entry is
+    /// `None` until that row's selection or cursor geometry is first needed.
+    col_x: Vec<Option<Vec<f64>>>,
+}
+
+/// Identity of the inputs that determine `draw_native`'s text measurements.
+/// Mirrors the `cached_render` invalidation in `main_loop` (buffer change,
+/// scroll, view size, font) and additionally tracks the rendered-line
+/// identity so an inlay re-tokenize, which leaves `change_id` untouched,
+/// still drops stale widths.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WidthKey {
+    lines_ptr: usize,
+    lines_len: usize,
+    total_tokens: usize,
+    change_id: i64,
+    scroll_y: u64,
+    rect_w: u64,
+    rect_h: u64,
+    font: u64,
+    font_height: u64,
+}
+
+/// Pixel advance of `ch` at running width `w`, reproducing the renderer's
+/// `group_text_width` exactly: tabs snap to the next tab stop from the row
+/// start, every other codepoint contributes its own glyph advance. `tab_w`
+/// memoizes the font's tab width for the rest of the frame.
+fn char_pixel_advance(
+    ctx: &dyn DrawContext,
+    font: u64,
+    tab_w: &mut Option<f32>,
+    w: f32,
+    ch: char,
+    buf: &mut [u8; 4],
+) -> f32 {
+    if ch == '\t' {
+        let tw = *tab_w.get_or_insert_with(|| ctx.font_width(font, "\t") as f32);
+        let r = w.rem_euclid(tw);
+        if r == 0.0 { tw } else { tw - r }
+    } else {
+        ctx.font_width(font, ch.encode_utf8(buf)) as f32
+    }
+}
+
+/// Cumulative rendered pixel offset of each buffer-column boundary in a
+/// visual row: index `k` is the width of the row's first `k` buffer
+/// characters, including any inlay overlays that precede them. Equals
+/// `font_width(rendered_prefix_to_buffer_col(tokens, k))` for every `k`
+/// while measuring the whole row in a single left-to-right pass.
+fn build_row_col_x(
+    ctx: &dyn DrawContext,
+    font: u64,
+    tab_w: &mut Option<f32>,
+    tokens: &[RenderToken],
+) -> Vec<f64> {
+    let mut col_x = Vec::with_capacity(row_buffer_char_count(tokens) + 1);
+    // Accumulate in f32 in token-stream order so the running offset matches
+    // the renderer's f32 fold bit for bit at every recorded boundary.
+    let mut w = 0.0f32;
+    let mut buf = [0u8; 4];
+    col_x.push(0.0);
+    for tok in tokens {
+        if tok.is_inlay {
+            for ch in tok.text.chars() {
+                w += char_pixel_advance(ctx, font, tab_w, w, ch, &mut buf);
+            }
+        } else {
+            for ch in tok.text.chars() {
+                w += char_pixel_advance(ctx, font, tab_w, w, ch, &mut buf);
+                col_x.push(w as f64);
+            }
+        }
+    }
+    col_x
+}
+
 impl DocView {
+    /// Rendered pixel offset of buffer column `buffer_col` within visual row
+    /// `row_idx`, served from the per-row cache and built on first use. The
+    /// column-to-pixel map is the data the selection and cursor geometry need,
+    /// so they read it directly instead of allocating and remeasuring a prefix
+    /// string each frame.
+    fn prefix_pixel_width(
+        &self,
+        ctx: &dyn DrawContext,
+        font: u64,
+        tab_w: &mut Option<f32>,
+        row_idx: usize,
+        tokens: &[RenderToken],
+        buffer_col: usize,
+    ) -> f64 {
+        {
+            let mut cache = self.width_cache.borrow_mut();
+            if let Some(slot) = cache.col_x.get_mut(row_idx) {
+                if slot.is_none() {
+                    *slot = Some(build_row_col_x(ctx, font, tab_w, tokens));
+                }
+                if let Some(v) = slot.as_ref().and_then(|c| c.get(buffer_col)) {
+                    return *v;
+                }
+            }
+        }
+        // Column past the row's last buffer char (a cursor parked beyond the
+        // line end with trailing inlay overlays): measure the exact rendered
+        // prefix so the caret still lands on the drawn glyphs.
+        ctx.font_width(font, &rendered_prefix_to_buffer_col(tokens, buffer_col))
+    }
+
     /// Draw a document natively. `lines` contains pre-tokenized lines for the
     /// visible range. `selections` contains all active selection ranges.
     /// Draw a document natively.
@@ -164,6 +287,38 @@ impl DocView {
         let gutter_w = self.gutter_width;
         let text_x = self.rect.x + gutter_w;
         let text_w = (self.rect.w - gutter_w).max(0.0);
+
+        // Validate the per-frame measurement cache against the inputs that
+        // also rebuild `cached_render`; a mismatch drops stale widths before
+        // any are read this frame. `lines` is the Arc-shared render result, so
+        // its pointer plus token count detects an inlay re-tokenize that keeps
+        // `change_id` unchanged.
+        let frame_change_id = self
+            .buffer_id
+            .and_then(|id| buffer::with_buffer(id, |b| Ok(b.change_id)).ok())
+            .unwrap_or(-1);
+        let width_key = WidthKey {
+            lines_ptr: lines.as_ptr() as usize,
+            lines_len: lines.len(),
+            total_tokens: lines.iter().map(|l| l.tokens.len()).sum(),
+            change_id: frame_change_id,
+            scroll_y: self.scroll_y.to_bits(),
+            rect_w: self.rect.w.to_bits(),
+            rect_h: self.rect.h.to_bits(),
+            font: style.code_font,
+            font_height: style.code_font_height.to_bits(),
+        };
+        {
+            let mut cache = self.width_cache.borrow_mut();
+            if cache.key != Some(width_key) {
+                cache.key = Some(width_key);
+                cache.max_line_w = None;
+                cache.col_x.clear();
+                cache.col_x.resize(lines.len(), None);
+            }
+        }
+        // Memoizes the font's tab width across this frame's prefix folds.
+        let mut tab_w: Option<f32> = None;
 
         ctx.set_clip_rect(self.rect.x, self.rect.y, self.rect.w, self.rect.h);
 
@@ -317,15 +472,24 @@ impl DocView {
                 // Convert to 0-based buffer-char offsets within the row.
                 let start_in_row = clipped_start - row_start_col;
                 let end_in_row = clipped_end - row_start_col;
-                let sel_x = text_x + style.padding_x - self.scroll_x
-                    + ctx.font_width(
+                let base_x = text_x + style.padding_x - self.scroll_x;
+                let sel_x = base_x
+                    + self.prefix_pixel_width(
+                        &*ctx,
                         style.code_font,
-                        &rendered_prefix_to_buffer_col(&line.tokens, start_in_row),
+                        &mut tab_w,
+                        i,
+                        &line.tokens,
+                        start_in_row,
                     );
-                let sel_end_x = text_x + style.padding_x - self.scroll_x
-                    + ctx.font_width(
+                let sel_end_x = base_x
+                    + self.prefix_pixel_width(
+                        &*ctx,
                         style.code_font,
-                        &rendered_prefix_to_buffer_col(&line.tokens, end_in_row),
+                        &mut tab_w,
+                        i,
+                        &line.tokens,
+                        end_in_row,
                     );
                 let sel_w = (sel_end_x - sel_x).max(0.0);
                 ctx.draw_rect(sel_x, y, sel_w, line_h, style.selection.to_array());
@@ -434,9 +598,15 @@ impl DocView {
                 }
                 if let Some((i, line, within_col)) = target {
                     let y = self.rect.y + first_visual_row + (i as f64 * line_h) - self.scroll_y;
-                    let before = rendered_prefix_to_buffer_col(&line.tokens, within_col);
                     let cx = text_x + style.padding_x - self.scroll_x
-                        + ctx.font_width(style.code_font, &before);
+                        + self.prefix_pixel_width(
+                            &*ctx,
+                            style.code_font,
+                            &mut tab_w,
+                            i,
+                            &line.tokens,
+                            within_col,
+                        );
                     ctx.draw_rect(cx, y, style.caret_width, line_h, style.caret.to_array());
                 }
             }
@@ -479,16 +649,25 @@ impl DocView {
         // Horizontal scrollbar — measure the widest visible rendered line; if it
         // exceeds the text area, draw a track + thumb at the bottom edge.
         if !lines.is_empty() {
-            let mut max_line_w = 0.0_f64;
-            for line in lines {
-                let mut w = 0.0_f64;
-                for token in &line.tokens {
-                    w += ctx.font_width(style.code_font, &token.text);
+            let max_line_w = {
+                let mut cache = self.width_cache.borrow_mut();
+                if let Some(w) = cache.max_line_w {
+                    w
+                } else {
+                    let mut max_line_w = 0.0_f64;
+                    for line in lines {
+                        let mut w = 0.0_f64;
+                        for token in &line.tokens {
+                            w += ctx.font_width(style.code_font, &token.text);
+                        }
+                        if w > max_line_w {
+                            max_line_w = w;
+                        }
+                    }
+                    cache.max_line_w = Some(max_line_w);
+                    max_line_w
                 }
-                if w > max_line_w {
-                    max_line_w = w;
-                }
-            }
+            };
             let text_w =
                 (self.rect.w - gutter_w - style.padding_x * 2.0 - style.scrollbar_size).max(0.0);
             if max_line_w > text_w && text_w > 0.0 {

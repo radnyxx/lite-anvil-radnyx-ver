@@ -1,10 +1,10 @@
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use std::sync::LazyLock;
 
 use crate::editor::types::Color;
 
 /// Global style context, synced once per frame.
-static STYLE: Lazy<Mutex<StyleContext>> = Lazy::new(|| Mutex::new(StyleContext::default()));
+static STYLE: LazyLock<Mutex<StyleContext>> = LazyLock::new(|| Mutex::new(StyleContext::default()));
 
 /// Get a copy of the current style context.
 pub fn current_style() -> StyleContext {

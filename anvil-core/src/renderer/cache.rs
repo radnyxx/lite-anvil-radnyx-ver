@@ -190,8 +190,11 @@ impl RenCache {
         color: RenColor,
         tab_offset: f32,
     ) -> f32 {
+        let Some(first) = fonts.first() else {
+            return x;
+        };
         let width = group_text_width(&fonts, &text, tab_offset);
-        let height = fonts[0].lock().height;
+        let height = first.lock().height;
         let bounding = RenRect {
             x: x as i32,
             y,
@@ -562,6 +565,9 @@ unsafe fn draw_text_surface(
     if dt.color.a == 0 {
         return;
     }
+    let Some(first_font) = dt.fonts.first() else {
+        return;
+    };
     let clip_x2 = clip.x + clip.w;
     let clip_y2 = clip.y + clip.h;
     let color = dt.color;
@@ -577,21 +583,21 @@ unsafe fn draw_text_surface(
         // Find glyph from font group (first font with a valid glyph wins).
         let (glyph, _font_height) = get_group_glyph(&dt.fonts, cp);
         let xadv = if cp == b'\t' as u32 {
-            let f = dt.fonts[0].lock();
+            let f = first_font.lock();
             let tab_w = f.space_advance * f.tab_size as f32;
             let r = ((pen_x - dt.x) + dt.tab_offset).rem_euclid(tab_w);
             if r == 0.0 { tab_w } else { tab_w - r }
         } else if !is_whitespace(cp) && glyph.xadvance > 0.0 {
             glyph.xadvance
         } else {
-            dt.fonts[0].lock().space_advance
+            first_font.lock().space_advance
         };
 
         if let Some(ref bm) = glyph.bitmap {
             let start_x = pen_x.floor() as i32 + bm.left;
             let end_x = start_x + bm.width as i32;
             if start_x < clip_x2 && end_x > clip.x {
-                let baseline = dt.fonts[0].lock().baseline;
+                let baseline = first_font.lock().baseline;
                 for row in 0..bm.rows as i32 {
                     let dst_y = row + dt.y - bm.top + baseline;
                     if dst_y < clip.y || dst_y >= clip_y2 {
@@ -652,7 +658,7 @@ fn glyph_usable(info: &GlyphInfo) -> bool {
 /// Find the glyph for `codepoint` using the font group (first font with glyph
 /// wins), then the system fallback fonts. Returns the GlyphInfo clone and the
 /// chosen font's height; if nothing covers the codepoint, the first font's
-/// .notdef box.
+/// .notdef box. Precondition: `fonts` is non-empty.
 fn get_group_glyph(fonts: &[FontRef], codepoint: u32) -> (GlyphInfo, i32) {
     let (first, height, size, aa, hinting) = {
         let mut g = fonts[0].lock();
@@ -681,11 +687,51 @@ fn get_group_glyph(fonts: &[FontRef], codepoint: u32) -> (GlyphInfo, i32) {
     })
 }
 
+/// Advance width of `codepoint` across the font group's fallback order. The
+/// group analog of `FontInner::glyph_advance`: it matches `get_group_glyph`'s
+/// font selection but yields only the f32 advance, so width measurement never
+/// clones a glyph bitmap. Precondition: `fonts` is non-empty.
+fn get_group_advance(fonts: &[FontRef], codepoint: u32) -> f32 {
+    // The advance and usability are read from the same locked reference, so
+    // the chosen font's `glyph_advance` is taken without an extra lookup.
+    let (advance, usable, size, aa, hinting) = {
+        let mut g = fonts[0].lock();
+        let info = g.get_glyph(codepoint);
+        (
+            info.xadvance,
+            glyph_usable(info),
+            g.size,
+            g.antialiasing,
+            g.hinting,
+        )
+    };
+    if is_whitespace(codepoint) || usable {
+        return advance;
+    }
+    for font in &fonts[1..] {
+        let mut g = font.lock();
+        let info = g.get_glyph(codepoint);
+        if glyph_usable(info) {
+            return info.xadvance;
+        }
+    }
+    match fallback::system_glyph(codepoint, size, aa, hinting) {
+        Some((glyph, _)) => glyph.xadvance,
+        None => {
+            fallback::note_uncovered(codepoint);
+            advance
+        }
+    }
+}
+
 /// Compute the rendered width of `text` in pixels using the full font group,
 /// matching the per-glyph advances `draw_text_surface` applies.
 pub(crate) fn group_text_width(fonts: &[FontRef], text: &str, tab_offset: f32) -> f32 {
+    let Some(first) = fonts.first() else {
+        return 0.0;
+    };
     let (space_advance, tab_size) = {
-        let f = fonts[0].lock();
+        let f = first.lock();
         (f.space_advance, f.tab_size)
     };
     let tab_w = space_advance * tab_size as f32;
@@ -701,12 +747,8 @@ pub(crate) fn group_text_width(fonts: &[FontRef], text: &str, tab_offset: f32) -
             w += space_advance;
             continue;
         }
-        let (glyph, _) = get_group_glyph(fonts, cp);
-        w += if glyph.xadvance > 0.0 {
-            glyph.xadvance
-        } else {
-            space_advance
-        };
+        let adv = get_group_advance(fonts, cp);
+        w += if adv > 0.0 { adv } else { space_advance };
     }
     w
 }
@@ -789,6 +831,29 @@ mod tests {
         // U+FFFFE is a noncharacter no font maps.
         let (glyph, _) = get_group_glyph(&fonts, 0xFFFFE);
         assert!(!glyph.defined);
+    }
+
+    #[test]
+    fn empty_font_group_measures_zero_width() {
+        let fonts: Vec<FontRef> = Vec::new();
+        assert_eq!(group_text_width(&fonts, "abc", 0.0), 0.0);
+    }
+
+    #[test]
+    fn push_draw_text_empty_group_is_noop() {
+        let mut cache = RenCache::new();
+        cache.begin_frame(800, 600);
+        let fonts: Arc<[FontRef]> = Arc::from(Vec::<FontRef>::new());
+        let x = cache.push_draw_text(
+            fonts,
+            Box::<str>::from("hi"),
+            10.0,
+            20,
+            RenColor::default(),
+            0.0,
+        );
+        assert_eq!(x, 10.0);
+        assert!(cache.commands.is_empty());
     }
 
     #[test]

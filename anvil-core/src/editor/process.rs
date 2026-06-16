@@ -1,5 +1,6 @@
 use libc::{self, c_int, pid_t};
 use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 
 pub const READ_BUF_SIZE: usize = 2048;
 
@@ -15,6 +16,12 @@ pub const REDIRECT_DISCARD: i32 = -2;
 pub const REDIRECT_PARENT: i32 = -3;
 
 pub const INVALID_FD: c_int = -1;
+
+/// Exit code used by a forked child that detects its parent already vanished
+/// before the parent-death signal could be armed. Mirrors the shell convention
+/// for "terminated by SIGTERM".
+#[cfg(target_os = "linux")]
+pub(crate) const EXIT_PARENT_LOST: c_int = 128 + libc::SIGTERM;
 
 /// Process operation errors.
 #[derive(Debug, thiserror::Error)]
@@ -225,6 +232,89 @@ pub fn parse_env_string(s: &str) -> Result<Vec<(CString, CString)>, ProcessError
     Ok(pairs)
 }
 
+/// Owns the `CString` backing storage and the NUL-terminated pointer array for
+/// an environment block passed to `execve`/`execvpe`. The pointers borrow from
+/// the entries, so both are kept together and outlive the fork in the parent.
+pub(crate) struct Envp {
+    _entries: Vec<CString>,
+    ptrs: Vec<*const libc::c_char>,
+}
+
+impl Envp {
+    /// Build an envp by merging the inherited process environment with
+    /// `overrides`; an override replaces an inherited key, otherwise it is
+    /// appended. Built in the parent so the child only has to call exec.
+    pub(crate) fn build(overrides: &[(CString, CString)]) -> Self {
+        let mut merged: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
+            .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+            .collect();
+        for (key, value) in overrides {
+            let key_bytes = key.as_bytes();
+            if let Some(slot) = merged.iter_mut().find(|(k, _)| k == key_bytes) {
+                slot.1 = value.as_bytes().to_vec();
+            } else {
+                merged.push((key_bytes.to_vec(), value.as_bytes().to_vec()));
+            }
+        }
+        let entries: Vec<CString> = merged
+            .into_iter()
+            .filter_map(|(mut k, v)| {
+                k.push(b'=');
+                k.extend_from_slice(&v);
+                CString::new(k).ok()
+            })
+            .collect();
+        let ptrs = entries
+            .iter()
+            .map(|s| s.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        Self {
+            _entries: entries,
+            ptrs,
+        }
+    }
+
+    /// Pointer to the NUL-terminated `envp` array for `execve`/`execvpe`.
+    pub(crate) fn as_ptr(&self) -> *const *const libc::c_char {
+        self.ptrs.as_ptr()
+    }
+}
+
+/// Resolve `program` to an executable path via PATH lookup, for targets without
+/// `execvpe`. Returns `program` unchanged when it already contains a separator.
+/// Runs in the parent; `execve` in the child needs an explicit path.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn resolve_program(
+    program: &std::ffi::CStr,
+    overrides: &[(CString, CString)],
+) -> Option<CString> {
+    use std::ffi::OsStr;
+    let name = program.to_bytes();
+    if name.contains(&b'/') {
+        return Some(program.to_owned());
+    }
+    let path_value = overrides
+        .iter()
+        .find(|(k, _)| k.as_bytes() == b"PATH")
+        .map(|(_, v)| OsStr::from_bytes(v.as_bytes()).to_owned())
+        .or_else(|| std::env::var_os("PATH"))?;
+    for dir in std::env::split_paths(&path_value) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(OsStr::from_bytes(name));
+        let Ok(c) = CString::new(candidate.as_os_str().as_bytes()) else {
+            continue;
+        };
+        // SAFETY: `c` is a valid NUL-terminated path; access(2) only reads.
+        if unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0 {
+            return Some(c);
+        }
+    }
+    None
+}
+
 /// Spawn a subprocess via fork+exec. Returns `ProcessInner` on success.
 pub fn spawn(cmd_args: &[CString], opts: &SpawnOptions) -> Result<ProcessInner, ProcessError> {
     if cmd_args.is_empty() {
@@ -312,6 +402,29 @@ fn fork_exec(
         bail!("cannot set FD_CLOEXEC on control pipe".into());
     }
 
+    // The full environment and (where execvpe is unavailable) the resolved
+    // program path are prepared here, in the parent, so the child between fork
+    // and exec only calls async-signal-safe primitives.
+    let envp = Envp::build(env_pairs);
+    let envp_ptr = envp.as_ptr();
+    let argv_ptr = argv_ptrs.as_ptr();
+    #[cfg(target_os = "linux")]
+    let exec_target = argv_ptrs[0];
+    #[cfg(not(target_os = "linux"))]
+    let exec_target = {
+        // SAFETY: argv_ptrs[0] points into cmd_args, owned by the caller for this call.
+        let program = unsafe { std::ffi::CStr::from_ptr(argv_ptrs[0]) };
+        match resolve_program(program, env_pairs) {
+            Some(path) => path,
+            None => bail!("error: cannot find executable in PATH".into()),
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let exec_target_ptr = exec_target.as_ptr();
+    #[cfg(target_os = "linux")]
+    // SAFETY: getpid never fails and has no preconditions.
+    let parent_pid = unsafe { libc::getpid() };
+
     // SAFETY: Standard Unix fork.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -319,9 +432,24 @@ fn fork_exec(
     }
 
     if pid == 0 {
-        // SAFETY: Child process, only async-signal-safe functions called.
+        // SAFETY: child process; only async-signal-safe primitives are called
+        // here (the environment and program path were prepared in the parent).
         unsafe {
+            #[cfg(target_os = "linux")]
             if !detach {
+                // Deliver SIGTERM to this child if the editor dies, so a hard
+                // editor exit (abort never unwinds Drop-based cleanup) cannot
+                // leave the child reparented to init as an orphan.
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong);
+                // If the editor already exited before the line above ran the
+                // death signal was missed, so exit now rather than linger.
+                if libc::getppid() != parent_pid {
+                    libc::_exit(EXIT_PARENT_LOST);
+                }
+            }
+            if !detach {
+                // Own process group: the editor group-signals this subtree on
+                // shutdown, the only reaping path on targets without pdeathsig.
                 libc::setpgid(0, 0);
             }
             for stream in 0..3i32 {
@@ -349,9 +477,6 @@ fn fork_exec(
                 };
                 libc::close(parent_end);
             }
-            for (k, v) in env_pairs {
-                libc::setenv(k.as_ptr(), v.as_ptr(), 1);
-            }
             if let Some(cwd) = cwd_cs {
                 if libc::chdir(cwd.as_ptr()) == -1 {
                     let err = get_errno();
@@ -366,7 +491,10 @@ fn fork_exec(
             if detach {
                 libc::setsid();
             }
-            libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr());
+            #[cfg(target_os = "linux")]
+            libc::execvpe(exec_target, argv_ptr, envp_ptr);
+            #[cfg(not(target_os = "linux"))]
+            libc::execve(exec_target_ptr, argv_ptr, envp_ptr);
             let err = get_errno();
             let _ = libc::write(
                 ctrl[1],

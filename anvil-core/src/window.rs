@@ -244,7 +244,11 @@ fn set_window_icon(win: *mut SDL_Window) {
         }
     };
 
-    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let Some(buf_size) = reader.output_buffer_size() else {
+        eprintln!("icon: PNG output buffer size exceeds addressable memory");
+        return;
+    };
+    let mut buf = vec![0u8; buf_size];
     let info = match reader.next_frame(&mut buf) {
         Ok(i) => i,
         Err(e) => {
@@ -744,19 +748,21 @@ pub fn with_window_surface<F>(f: F)
 where
     F: FnOnce(*mut SDL_Surface, *mut SDL_Window),
 {
-    SDL.with(|s| {
-        let guard = s.borrow();
-        if let Some(ref st) = *guard {
-            if let Some(ref w) = st.window {
-                let raw_win = w.raw;
-                // SAFETY: raw_win is valid; SDL_GetWindowSurface is safe to call.
-                let surface = unsafe { SDL_GetWindowSurface(raw_win) };
-                if !surface.is_null() {
-                    f(surface, raw_win);
-                }
-            }
-        }
+    let raw_win = SDL.with(|s| {
+        s.borrow()
+            .as_ref()
+            .and_then(|st| st.window.as_ref())
+            .map(|w| w.raw)
     });
+    // The SDL state borrow is released before `f` runs so the callback may
+    // reentrantly access window state without a double mutable borrow.
+    if let Some(raw_win) = raw_win {
+        // SAFETY: raw_win is a valid SDL_Window pointer for the window's lifetime.
+        let surface = unsafe { SDL_GetWindowSurface(raw_win) };
+        if !surface.is_null() {
+            f(surface, raw_win);
+        }
+    }
 }
 
 /// Bring the window to the foreground and give it input focus.

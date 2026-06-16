@@ -1,6 +1,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Initial respawn backoff after the first consecutive spawn failure.
+const RESPAWN_BACKOFF_BASE_MS: u64 = 250;
+/// Upper bound on respawn backoff so a crash-looping server is retried
+/// at a steady, bounded cadence rather than ever-growing delays.
+const RESPAWN_BACKOFF_CAP_MS: u64 = 30_000;
 
 use crate::editor::lsp;
 
@@ -50,6 +56,12 @@ pub(crate) struct LspState {
     /// edits, ...) regardless of which command produced it, so the
     /// debounced didChange + inlayHint re-request fires every time.
     pub last_seen_change_id: HashMap<String, i64>,
+    /// Consecutive spawn/initialize failures, driving exponential respawn
+    /// backoff so a crash-looping server is not relaunched every frame.
+    pub respawn_failures: u32,
+    /// Monotonic instant of the most recent spawn failure, gating the next
+    /// respawn attempt. `None` once a spawn has succeeded.
+    pub last_spawn_failure: Option<Instant>,
 }
 
 impl LspState {
@@ -71,6 +83,8 @@ impl LspState {
             inlay_retry_at: None,
             inlay_retry_count: 0,
             last_seen_change_id: HashMap::new(),
+            respawn_failures: 0,
+            last_spawn_failure: None,
         }
     }
 
@@ -78,6 +92,39 @@ impl LspState {
         let id = self.next_request_id;
         self.next_request_id += 1;
         id
+    }
+
+    /// Backoff delay required before the next respawn at the current failure level.
+    fn respawn_backoff(&self) -> Duration {
+        if self.respawn_failures == 0 {
+            return Duration::ZERO;
+        }
+        // 250ms, 500ms, 1s, 2s, ... doubling per failure, capped.
+        let shift = (self.respawn_failures - 1).min(20);
+        let ms = RESPAWN_BACKOFF_BASE_MS
+            .saturating_mul(1u64 << shift)
+            .min(RESPAWN_BACKOFF_CAP_MS);
+        Duration::from_millis(ms)
+    }
+
+    /// Whether enough monotonic time has elapsed to retry spawning the server.
+    pub fn should_attempt_spawn(&self) -> bool {
+        match self.last_spawn_failure {
+            None => true,
+            Some(at) => at.elapsed() >= self.respawn_backoff(),
+        }
+    }
+
+    /// Record a failed spawn/initialize: raise the backoff level and stamp the time.
+    pub fn note_spawn_failure(&mut self) {
+        self.respawn_failures = self.respawn_failures.saturating_add(1);
+        self.last_spawn_failure = Some(Instant::now());
+    }
+
+    /// Record a successful initialize: clear the backoff so future spawns are immediate.
+    pub fn note_spawn_success(&mut self) {
+        self.respawn_failures = 0;
+        self.last_spawn_failure = None;
     }
 }
 
@@ -398,6 +445,41 @@ mod tests {
         assert!(s.pending_requests.is_empty());
         assert_eq!(s.next_request_id, 1);
         assert!(s.inlay_hints.is_empty());
+    }
+
+    #[test]
+    fn respawn_backoff_gates_attempts() {
+        let mut s = LspState::new();
+        // A fresh state has no failures, so a spawn is allowed immediately.
+        assert!(s.should_attempt_spawn());
+
+        // A failure stamps the backoff window; the next attempt is gated.
+        s.note_spawn_failure();
+        assert_eq!(s.respawn_failures, 1);
+        assert!(!s.should_attempt_spawn());
+
+        // Backoff grows with consecutive failures and stays within the cap.
+        s.note_spawn_failure();
+        assert_eq!(s.respawn_failures, 2);
+        assert!(s.respawn_backoff() <= Duration::from_millis(RESPAWN_BACKOFF_CAP_MS));
+
+        // A success clears the backoff so spawns are immediate again.
+        s.note_spawn_success();
+        assert_eq!(s.respawn_failures, 0);
+        assert!(s.last_spawn_failure.is_none());
+        assert!(s.should_attempt_spawn());
+    }
+
+    #[test]
+    fn respawn_backoff_is_capped() {
+        let mut s = LspState::new();
+        for _ in 0..40 {
+            s.note_spawn_failure();
+        }
+        assert_eq!(
+            s.respawn_backoff(),
+            Duration::from_millis(RESPAWN_BACKOFF_CAP_MS)
+        );
     }
 
     #[test]

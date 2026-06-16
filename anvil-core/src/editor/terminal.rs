@@ -223,6 +223,29 @@ pub fn spawn_terminal(
         ws_ypixel: 0,
     };
 
+    // The full environment and (where execvpe is unavailable) the resolved
+    // program path are prepared here, in the parent, so the child between
+    // forkpty and exec only calls async-signal-safe primitives.
+    let envp = crate::editor::process::Envp::build(&opts.env);
+    let envp_ptr = envp.as_ptr();
+    let argv_ptr = argv_ptrs.as_ptr();
+    #[cfg(target_os = "linux")]
+    let exec_target = argv_ptrs[0];
+    #[cfg(not(target_os = "linux"))]
+    let exec_target = {
+        // SAFETY: argv_ptrs[0] points into cmd_args, owned by the caller for this call.
+        let program = unsafe { std::ffi::CStr::from_ptr(argv_ptrs[0]) };
+        match crate::editor::process::resolve_program(program, &opts.env) {
+            Some(path) => path,
+            None => return Err("terminal.spawn: cannot find executable in PATH".into()),
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let exec_target_ptr = exec_target.as_ptr();
+    #[cfg(target_os = "linux")]
+    // SAFETY: getpid never fails and has no preconditions.
+    let parent_pid = unsafe { libc::getpid() };
+
     let mut master_fd = INVALID_FD;
     // SAFETY: Standard Unix forkpty.
     let pid = unsafe {
@@ -241,16 +264,31 @@ pub fn spawn_terminal(
     }
 
     if pid == 0 {
-        // SAFETY: Child process.
+        // SAFETY: child process; only async-signal-safe primitives are called
+        // here (the environment and program path were prepared in the parent).
         unsafe {
-            libc::setpgid(0, 0);
-            for (k, v) in &opts.env {
-                libc::setenv(k.as_ptr(), v.as_ptr(), 1);
+            #[cfg(target_os = "linux")]
+            {
+                // Deliver SIGTERM to this child if the editor dies, so a hard
+                // editor exit (abort never unwinds Drop-based cleanup) cannot
+                // leave the terminal child reparented to init as an orphan.
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong);
+                // If the editor already exited before the line above ran the
+                // death signal was missed, so exit now rather than linger.
+                if libc::getppid() != parent_pid {
+                    libc::_exit(crate::editor::process::EXIT_PARENT_LOST);
+                }
             }
+            // Own process group: the editor group-signals this subtree on
+            // shutdown, the only reaping path on targets without pdeathsig.
+            libc::setpgid(0, 0);
             if let Some(ref cwd) = opts.cwd {
                 libc::chdir(cwd.as_ptr());
             }
-            libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr());
+            #[cfg(target_os = "linux")]
+            libc::execvpe(exec_target, argv_ptr, envp_ptr);
+            #[cfg(not(target_os = "linux"))]
+            libc::execve(exec_target_ptr, argv_ptr, envp_ptr);
             libc::_exit(127);
         }
     }

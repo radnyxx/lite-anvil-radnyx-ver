@@ -3,8 +3,8 @@ use std::fs;
 use std::io::Write;
 use std::time::Instant;
 
-use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use std::sync::{Arc, LazyLock};
 
 /// Byte Order Mark types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +74,7 @@ impl BomType {
     }
 }
 
-static START_TIME: Lazy<Instant> = Lazy::new(Instant::now);
+static START_TIME: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// Monotonic time in seconds since first call.
 pub fn now_secs() -> f64 {
@@ -109,6 +109,17 @@ pub const HUGE_FILE_THRESHOLD: u64 = 50 * 1024 * 1024;
 /// files just under `HUGE_FILE_THRESHOLD` that still get edited heavily.
 pub const UNDO_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
 
+/// Buffer content captured at the start of an undo group. The group is
+/// finalized into a compact inverse record (the byte-level diff of this
+/// base against the post-edit buffer) at the next group boundary or on the
+/// first undo, so an edit stores work proportional to its own size rather
+/// than the whole document.
+pub struct PendingUndo {
+    base_text: String,
+    base_selections: Vec<usize>,
+    base_change_id: i64,
+}
+
 /// Document buffer state: lines, selections, undo/redo, and metadata
 /// (encoding, BOM, line endings) learned at load time.
 pub struct BufferState {
@@ -116,6 +127,10 @@ pub struct BufferState {
     pub selections: Vec<usize>,
     pub undo: Vec<Vec<u8>>,
     pub redo: Vec<Vec<u8>>,
+    /// The undo group currently being assembled. Captured by `push_undo`
+    /// before an edit and committed to `undo` as a packed inverse record
+    /// at the next group boundary, on undo, or on redo.
+    pub pending: Option<PendingUndo>,
     pub change_id: i64,
     /// Sum of the byte lengths of every line. Computed on load and refreshed
     /// after undo/redo restores. Drives `is_huge()` which gates `push_undo`
@@ -127,6 +142,10 @@ pub struct BufferState {
     pub bom: BomType,
     pub sig_cache: (i64, u32),
     pub last_edit: Option<(f64, usize, usize, bool, bool)>,
+    /// Concatenated document text plus per-line byte offsets, memoized by
+    /// `change_id` for repeated whole-document regex scans (find/replace as you
+    /// type). Rebuilt lazily by `search_subject_cached` after any edit.
+    pub search_cache: Option<(i64, Arc<SearchSubject>)>,
 }
 
 impl BufferState {
@@ -137,9 +156,9 @@ impl BufferState {
     }
 }
 
-pub static BUFFERS: Lazy<Mutex<HashMap<u64, BufferState>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-static NEXT_BUFFER_ID: Lazy<Mutex<u64>> = Lazy::new(|| Mutex::new(1));
+pub static BUFFERS: LazyLock<Mutex<HashMap<u64, BufferState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_BUFFER_ID: LazyLock<Mutex<u64>> = LazyLock::new(|| Mutex::new(1));
 
 /// Allocate a new buffer ID.
 pub fn next_buffer_id() -> u64 {
@@ -158,12 +177,14 @@ pub fn default_buffer_state() -> BufferState {
         selections: vec![1, 1, 1, 1],
         undo: Vec::new(),
         redo: Vec::new(),
+        pending: None,
         change_id: 1,
         total_bytes: 1,
         crlf: false,
         bom: BomType::None,
         sig_cache: (1, sig),
         last_edit: None,
+        search_cache: None,
     }
 }
 
@@ -758,6 +779,7 @@ pub fn deserialize_history(data: &[u8]) -> Option<HistoryPair> {
 pub fn reset_history(state: &mut BufferState) {
     state.undo.clear();
     state.redo.clear();
+    state.pending = None;
     state.undo.shrink_to_fit();
     state.redo.shrink_to_fit();
 }
@@ -1057,32 +1079,140 @@ fn trim_history_to_budget(state: &mut BufferState) {
     }
 }
 
-/// Snapshot the current buffer state for undo.
+/// Pack an undo/redo stack entry: the `change_id` and selections to restore
+/// when the entry is applied, followed by the edits to replay.
+fn pack_undo_entry(change_id: i64, selections: &[usize], edits: &[EditRecord]) -> Vec<u8> {
+    let mut out = change_id.to_le_bytes().to_vec();
+    out.extend_from_slice(&pack_record(selections, edits));
+    out
+}
+
+/// Unpack a stack entry produced by `pack_undo_entry`.
+fn unpack_undo_entry(input: &[u8]) -> Result<(i64, Vec<usize>, Vec<EditRecord>), BufferError> {
+    if input.len() < 8 {
+        return Err(BufferError::BadUndoRecord);
+    }
+    // The 8-byte prefix is present: the length check above guarantees it.
+    let change_id = i64::from_le_bytes(input[..8].try_into().unwrap());
+    let (selections, edits) = unpack_record(&input[8..])?;
+    Ok((change_id, selections, edits))
+}
+
+/// Compute the edits that transform `current` back into `base_text`. The
+/// changed span is the byte range between the two contents' common prefix
+/// and suffix, snapped to UTF-8 boundaries, expressed as a remove of the
+/// current span followed by an insert of the base span. Columns are 1-based
+/// byte offsets, matching `apply_single_edit`.
+fn diff_to_undo_edits(base_text: &str, current: &[String]) -> Vec<EditRecord> {
+    let cur_text: String = current.concat();
+    let bb = base_text.as_bytes();
+    let cb = cur_text.as_bytes();
+
+    let max_common = bb.len().min(cb.len());
+    let mut start = 0;
+    while start < max_common && bb[start] == cb[start] {
+        start += 1;
+    }
+    while start > 0 && (!base_text.is_char_boundary(start) || !cur_text.is_char_boundary(start)) {
+        start -= 1;
+    }
+
+    let max_suffix = (bb.len() - start).min(cb.len() - start);
+    let mut suffix = 0;
+    while suffix < max_suffix && bb[bb.len() - 1 - suffix] == cb[cb.len() - 1 - suffix] {
+        suffix += 1;
+    }
+    while suffix > 0
+        && (!base_text.is_char_boundary(bb.len() - suffix)
+            || !cur_text.is_char_boundary(cb.len() - suffix))
+    {
+        suffix -= 1;
+    }
+
+    let base_end = bb.len() - suffix;
+    let cur_end = cb.len() - suffix;
+
+    let mut line_starts = Vec::with_capacity(current.len());
+    let mut acc = 0usize;
+    for line in current {
+        line_starts.push(acc);
+        acc += line.len();
+    }
+    let to_line_col = |offset: usize| -> (usize, usize) {
+        let i = line_starts
+            .partition_point(|&s| s <= offset)
+            .saturating_sub(1);
+        (i + 1, offset - line_starts[i] + 1)
+    };
+
+    let (start_line, start_col) = to_line_col(start);
+    let mut edits = Vec::new();
+    if cur_end > start {
+        let (end_line, end_col) = to_line_col(cur_end);
+        edits.push(EditRecord {
+            kind: b'r',
+            line1: start_line,
+            col1: start_col,
+            line2: end_line,
+            col2: end_col,
+            text: String::new(),
+        });
+    }
+    if base_end > start {
+        edits.push(EditRecord {
+            kind: b'i',
+            line1: start_line,
+            col1: start_col,
+            line2: start_line,
+            col2: start_col,
+            text: base_text[start..base_end].to_string(),
+        });
+    }
+    edits
+}
+
+/// Commit the in-progress undo group (if any) to the undo stack as a
+/// compact packed inverse record, diffing the captured base against the
+/// current buffer.
+fn finalize_pending(state: &mut BufferState) {
+    let Some(pending) = state.pending.take() else {
+        return;
+    };
+    let edits = diff_to_undo_edits(&pending.base_text, &state.lines);
+    let entry = pack_undo_entry(pending.base_change_id, &pending.base_selections, &edits);
+    state.undo.push(entry);
+    clamp_history(&mut state.undo);
+    trim_history_to_budget(state);
+}
+
+/// Open a new undo group, capturing the pre-edit content as its base.
+///
+/// The group is committed to the undo stack lazily - at the next
+/// `push_undo`, on undo, or on redo - as a compact inverse record sized to
+/// the edit rather than the whole document. Consecutive single-character
+/// inserts merge into one group via `push_undo_mergeable`.
 ///
 /// On buffers over `HUGE_FILE_THRESHOLD` this becomes a no-op that only
-/// advances `change_id` and clears the redo stack — at multi-GB file sizes,
-/// JSON-serializing every line on each keystroke would lock up the editor.
-/// Callers don't need to special-case huge files; the function handles it.
+/// advances `change_id` and clears the redo stack - at multi-GB file sizes
+/// even capturing the base would lock up the editor. Callers don't need to
+/// special-case huge files; the function handles it.
 pub fn push_undo(state: &mut BufferState) {
     if state.is_huge() {
+        state.pending = None;
         state.redo.clear();
         state.change_id += 1;
         state.last_edit = None;
         return;
     }
-    let snapshot = serde_json::json!({
-        "lines": state.lines,
-        "selections": state.selections,
-        "change_id": state.change_id,
+    finalize_pending(state);
+    state.pending = Some(PendingUndo {
+        base_text: state.lines.concat(),
+        base_selections: state.selections.clone(),
+        base_change_id: state.change_id,
     });
-    state.undo.push(snapshot.to_string().into_bytes());
     state.redo.clear();
     state.change_id += 1;
     state.last_edit = None;
-    if state.undo.len() > 2_000 {
-        state.undo.remove(0);
-    }
-    trim_history_to_budget(state);
 }
 
 /// Push undo for a single-char insert, merging consecutive keystrokes.
@@ -1113,68 +1243,62 @@ pub fn push_undo_mergeable(
     false
 }
 
-/// Undo the last edit.
+/// Undo the most recent edit by replaying its packed inverse record onto
+/// the buffer and pushing the corresponding forward record onto redo.
 pub fn undo(state: &mut BufferState) {
-    let Some(snapshot) = state.undo.pop() else {
+    finalize_pending(state);
+    let Some(entry) = state.undo.pop() else {
         return;
     };
-    // Save current state to redo.
-    let current = serde_json::json!({
-        "lines": state.lines,
-        "selections": state.selections,
-        "change_id": state.change_id,
-    });
-    state.redo.push(current.to_string().into_bytes());
-    // Restore.
-    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&snapshot) {
-        if let Some(lines) = val["lines"].as_array() {
-            state.lines = lines
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-        }
-        if let Some(sels) = val["selections"].as_array() {
-            state.selections = sels
-                .iter()
-                .filter_map(|v| v.as_u64().map(|n| n as usize))
-                .collect();
-        }
-        if let Some(cid) = val["change_id"].as_i64() {
-            state.change_id = cid;
-        }
+    let Ok((restore_change_id, restore_selections, edits)) = unpack_undo_entry(&entry) else {
+        return;
+    };
+    let redo_change_id = state.change_id;
+    let redo_selections = state.selections.clone();
+    let mut inverse = Vec::with_capacity(edits.len());
+    for edit in &edits {
+        inverse.push(apply_single_edit(
+            &mut state.lines,
+            &mut state.selections,
+            edit,
+        ));
     }
+    // Replay order reverses when stepping forward again.
+    inverse.reverse();
+    state
+        .redo
+        .push(pack_undo_entry(redo_change_id, &redo_selections, &inverse));
+    state.selections = restore_selections;
+    state.change_id = restore_change_id;
     state.total_bytes = state.lines.iter().map(|l| l.len() as u64).sum();
     state.last_edit = None;
 }
 
-/// Redo the last undone edit.
+/// Redo the most recently undone edit, the mirror of `undo`.
 pub fn redo(state: &mut BufferState) {
-    let Some(snapshot) = state.redo.pop() else {
+    finalize_pending(state);
+    let Some(entry) = state.redo.pop() else {
         return;
     };
-    let current = serde_json::json!({
-        "lines": state.lines,
-        "selections": state.selections,
-        "change_id": state.change_id,
-    });
-    state.undo.push(current.to_string().into_bytes());
-    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&snapshot) {
-        if let Some(lines) = val["lines"].as_array() {
-            state.lines = lines
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-        }
-        if let Some(sels) = val["selections"].as_array() {
-            state.selections = sels
-                .iter()
-                .filter_map(|v| v.as_u64().map(|n| n as usize))
-                .collect();
-        }
-        if let Some(cid) = val["change_id"].as_i64() {
-            state.change_id = cid;
-        }
+    let Ok((restore_change_id, restore_selections, edits)) = unpack_undo_entry(&entry) else {
+        return;
+    };
+    let undo_change_id = state.change_id;
+    let undo_selections = state.selections.clone();
+    let mut inverse = Vec::with_capacity(edits.len());
+    for edit in &edits {
+        inverse.push(apply_single_edit(
+            &mut state.lines,
+            &mut state.selections,
+            edit,
+        ));
     }
+    inverse.reverse();
+    state
+        .undo
+        .push(pack_undo_entry(undo_change_id, &undo_selections, &inverse));
+    state.selections = restore_selections;
+    state.change_id = restore_change_id;
     state.total_bytes = state.lines.iter().map(|l| l.len() as u64).sum();
     state.last_edit = None;
 }
@@ -1216,7 +1340,11 @@ pub fn get_selected_text(state: &BufferState) -> String {
         } else {
             text.chars().count()
         };
-        let slice: String = text.chars().skip(start).take(end - start).collect();
+        let slice: String = text
+            .chars()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .collect();
         result.push_str(&slice);
         if line_num < l2 {
             result.push('\n');
@@ -1230,6 +1358,10 @@ pub fn delete_selection(state: &mut BufferState) {
     if state.selections.len() < 4 {
         return;
     }
+    // Selections can outlive the edits that shrank the buffer (a stale
+    // range with `l2 > lines.len()` or `l1 == 0`). Clamp every range to
+    // valid lines and char boundaries before indexing.
+    sanitize_selections(&state.lines, &mut state.selections);
     let (l1, c1, l2, c2) = (
         state.selections[0],
         state.selections[1],
@@ -1293,42 +1425,112 @@ pub fn regex_find_in_line(
     Some((s + 1, e + 1))
 }
 
-/// Regex find across the whole document, newlines included. Returns 1-based
-/// (start_line, start_col, end_line, end_col) tuples. A match that consumes a
-/// line's trailing `\n` ends at column 1 of the following line, so deleting
-/// the matched range removes the line break too.
+/// The document concatenated into one byte string with per-line start offsets,
+/// the subject for a whole-document regex scan. Building it is O(document
+/// size), so it is memoized per `change_id` rather than rebuilt per keystroke.
+pub struct SearchSubject {
+    text: String,
+    line_starts: Vec<usize>,
+    /// Whole document is ASCII, so a byte offset within a line equals its
+    /// 1-based column and no UTF-8 char counting is needed to map columns.
+    ascii: bool,
+}
+
+impl SearchSubject {
+    /// Concatenate `lines` and record each line's byte offset within the result.
+    pub fn build(lines: &[String]) -> Self {
+        let text: String = lines.concat();
+        let mut line_starts = Vec::with_capacity(lines.len());
+        let mut acc = 0usize;
+        for l in lines {
+            line_starts.push(acc);
+            acc += l.len();
+        }
+        let ascii = text.is_ascii();
+        Self {
+            text,
+            line_starts,
+            ascii,
+        }
+    }
+
+    /// 1-based column of a byte offset that lies on line index `line`. For an
+    /// all-ASCII document the column is the byte distance from the line start;
+    /// otherwise the chars in that span are counted to stay codepoint-correct.
+    fn col(&self, line: usize, offset: usize) -> usize {
+        let start = self.line_starts[line];
+        if self.ascii {
+            offset - start + 1
+        } else {
+            self.text[start..offset].chars().count() + 1
+        }
+    }
+
+    /// Regex find across the whole document, newlines included. Returns 1-based
+    /// (start_line, start_col, end_line, end_col) tuples. A match that consumes
+    /// a line's trailing `\n` ends at column 1 of the following line, so
+    /// deleting the matched range removes the line break too.
+    pub fn find_all(
+        &self,
+        re: &crate::editor::regex::NativeRegex,
+    ) -> Vec<(usize, usize, usize, usize)> {
+        let mut out = Vec::new();
+        // Matches arrive in ascending offset order, so a single forward cursor
+        // resolves line numbers without a per-match binary search.
+        let mut line = 0usize;
+        let advance = |line: &mut usize, offset: usize| {
+            while *line + 1 < self.line_starts.len() && self.line_starts[*line + 1] <= offset {
+                *line += 1;
+            }
+        };
+        for m in re.find_iter(self.text.as_bytes(), 0) {
+            let Ok(m) = m else { break };
+            let (s, e) = m.span();
+            if e <= s {
+                continue;
+            }
+            advance(&mut line, s);
+            let (sl, sc) = (line + 1, self.col(line, s));
+            advance(&mut line, e);
+            let (el, ec) = (line + 1, self.col(line, e));
+            out.push((sl, sc, el, ec));
+        }
+        out
+    }
+}
+
+/// Cached search subject keyed by `change_id`. Repeat calls for the same
+/// `change_id` reuse the memoized subject (a cheap `Arc` clone) instead of
+/// re-concatenating the whole document; any edit bumps `change_id` and the
+/// subject is rebuilt on the next call. Mirrors `content_signature_cached`.
+pub fn search_subject_cached(state: &mut BufferState) -> Arc<SearchSubject> {
+    if let Some((id, subject)) = &state.search_cache {
+        if *id == state.change_id {
+            return Arc::clone(subject);
+        }
+    }
+    let subject = Arc::new(SearchSubject::build(&state.lines));
+    state.search_cache = Some((state.change_id, Arc::clone(&subject)));
+    subject
+}
+
+/// Regex find across the whole document, newlines included. See
+/// [`SearchSubject::find_all`]. Builds the subject from scratch; the
+/// keystroke-hot path uses [`search_subject_cached`] to avoid that cost.
 pub fn regex_find_all(
     lines: &[String],
     re: &crate::editor::regex::NativeRegex,
 ) -> Vec<(usize, usize, usize, usize)> {
-    let text: String = lines.concat();
-    let mut line_starts = Vec::with_capacity(lines.len());
-    let mut acc = 0usize;
-    for l in lines {
-        line_starts.push(acc);
-        acc += l.len();
-    }
-    let to_pos = |offset: usize| {
-        let i = line_starts.partition_point(|&s| s <= offset) - 1;
-        let col = text[line_starts[i]..offset].chars().count() + 1;
-        (i + 1, col)
-    };
-    let mut out = Vec::new();
-    for m in re.find_iter(text.as_bytes(), 0) {
-        let Ok(m) = m else { break };
-        let (s, e) = m.span();
-        if e <= s {
-            continue;
-        }
-        let (sl, sc) = to_pos(s);
-        let (el, ec) = to_pos(e);
-        out.push((sl, sc, el, ec));
-    }
-    out
+    SearchSubject::build(lines).find_all(re)
 }
 
 /// Plain text replacement. Returns (result, replacement_count).
 pub fn replace_plain(text: &str, old: &str, new: &str) -> (String, usize) {
+    // `find("")` matches at every position without consuming input, so an
+    // empty needle has no replacements to make.
+    if old.is_empty() {
+        return (text.to_string(), 0);
+    }
     let mut out = String::with_capacity(text.len());
     let mut pos = 0usize;
     let mut count = 0usize;
@@ -1345,7 +1547,11 @@ pub fn replace_plain(text: &str, old: &str, new: &str) -> (String, usize) {
 
 /// Regex replacement. Returns (result, replacement_count).
 pub fn replace_regex(text: &str, pattern: &str, new: &str) -> Result<(String, usize), String> {
-    let re = pcre2::bytes::Regex::new(pattern).map_err(|e| e.to_string())?;
+    // UTF mode makes PCRE2 report match offsets on codepoint boundaries, so
+    // slicing `text` at them never splits a multi-byte character.
+    let mut builder = pcre2::bytes::RegexBuilder::new();
+    builder.utf(true);
+    let re = builder.build(pattern).map_err(|e| e.to_string())?;
     let mut out = String::with_capacity(text.len());
     let mut pos = 0usize;
     let mut count = 0usize;
@@ -1361,8 +1567,14 @@ pub fn replace_regex(text: &str, pattern: &str, new: &str) -> Result<(String, us
         if e > s {
             pos = e;
         } else {
-            out.push_str(&text[s..s + 1]);
-            pos = s + 1;
+            // Zero-width match: emit the next whole character and step past
+            // it by its UTF-8 length to keep `pos` on a codepoint boundary.
+            let Some(ch) = text[s..].chars().next() else {
+                pos = s;
+                break;
+            };
+            out.push_str(&text[s..s + ch.len_utf8()]);
+            pos = s + ch.len_utf8();
         }
         if pos >= text.len() {
             break;
@@ -1437,6 +1649,30 @@ mod tests {
         let lines = vec!["héllo wörld\n".to_string()];
         let re = find_regex("wörld");
         assert_eq!(regex_find_all(&lines, &re), vec![(1, 7, 1, 12)]);
+    }
+
+    #[test]
+    fn cached_subject_matches_fresh_scan() {
+        let mut state = default_buffer_state();
+        state.lines = vec!["alpha beta\n".to_string(), "beta gamma\n".to_string()];
+        let re = find_regex("beta");
+        let cached = search_subject_cached(&mut state).find_all(&re);
+        assert_eq!(cached, regex_find_all(&state.lines, &re));
+    }
+
+    #[test]
+    fn cached_subject_reused_until_change_id_advances() {
+        let mut state = default_buffer_state();
+        state.lines = vec!["needle\n".to_string()];
+        let re = find_regex("needle");
+        let first = Arc::as_ptr(&search_subject_cached(&mut state));
+        // Same change_id: the very same allocation is handed back.
+        assert_eq!(first, Arc::as_ptr(&search_subject_cached(&mut state)));
+        state.lines = vec!["needle\n".to_string(), "needle\n".to_string()];
+        state.change_id += 1;
+        let rebuilt = search_subject_cached(&mut state);
+        assert_ne!(first, Arc::as_ptr(&rebuilt));
+        assert_eq!(rebuilt.find_all(&re), vec![(1, 1, 1, 7), (2, 1, 2, 7)]);
     }
 
     #[test]
@@ -1990,10 +2226,16 @@ mod tests {
     }
 
     #[test]
-    fn push_undo_small_buffer_stores_snapshot() {
+    fn push_undo_small_buffer_records_inverse_lazily() {
         let mut state = default_buffer_state();
         state.lines = vec!["small\n".to_string()];
         state.total_bytes = 6;
+        push_undo(&mut state);
+        // The group opens but is committed to the stack lazily, when the
+        // next boundary lets the diff against the post-edit buffer be taken.
+        assert!(state.pending.is_some());
+        assert!(state.undo.is_empty());
+        state.lines = vec!["smaller\n".to_string()];
         push_undo(&mut state);
         assert_eq!(state.undo.len(), 1);
     }
@@ -2033,5 +2275,170 @@ mod tests {
         undo(&mut state);
         assert_eq!(state.lines, vec!["hello\n".to_string()]);
         assert_eq!(state.total_bytes, 6);
+    }
+
+    #[test]
+    fn single_char_typing_then_undo() {
+        let mut state = default_buffer_state();
+        state.lines = vec!["hello\n".to_string()];
+        state.selections = vec![1, 6, 1, 6];
+        // Mirrors the live typing path: open a (mergeable) group, then
+        // mutate the line directly before the next boundary.
+        push_undo_mergeable(&mut state, 1, 6, false);
+        state.lines[0].insert(5, '!');
+        state.selections = vec![1, 7, 1, 7];
+        undo(&mut state);
+        assert_eq!(state.lines, vec!["hello\n".to_string()]);
+        assert_eq!(state.selections, vec![1, 6, 1, 6]);
+    }
+
+    #[test]
+    fn merged_keystrokes_undo_as_one_group() {
+        let mut state = default_buffer_state();
+        state.lines = vec!["\n".to_string()];
+        state.selections = vec![1, 1, 1, 1];
+        // Three adjacent single-char inserts merge into one undo group.
+        for (i, ch) in ['a', 'b', 'c'].into_iter().enumerate() {
+            let col = 1 + i;
+            push_undo_mergeable(&mut state, 1, col, false);
+            state.lines[0].insert(i, ch);
+            state.selections = vec![1, col + 1, 1, col + 1];
+        }
+        assert_eq!(state.lines, vec!["abc\n".to_string()]);
+        undo(&mut state);
+        assert_eq!(state.lines, vec!["\n".to_string()]);
+    }
+
+    #[test]
+    fn multi_line_insert_then_undo() {
+        let mut state = default_buffer_state();
+        state.lines = vec!["hello world\n".to_string()];
+        state.selections = vec![1, 6, 1, 6];
+        push_undo(&mut state);
+        apply_insert_internal(&mut state.lines, &mut state.selections, 1, 6, "\nMID\n");
+        assert_eq!(
+            state.lines,
+            vec![
+                "hello\n".to_string(),
+                "MID\n".to_string(),
+                " world\n".to_string()
+            ]
+        );
+        undo(&mut state);
+        assert_eq!(state.lines, vec!["hello world\n".to_string()]);
+    }
+
+    #[test]
+    fn multi_line_selection_delete_then_undo() {
+        let mut state = default_buffer_state();
+        state.lines = vec![
+            "line1\n".to_string(),
+            "line2\n".to_string(),
+            "line3\n".to_string(),
+        ];
+        state.selections = vec![1, 1, 3, 1];
+        push_undo(&mut state);
+        delete_selection(&mut state);
+        assert_eq!(state.lines, vec!["line3\n".to_string()]);
+        undo(&mut state);
+        assert_eq!(
+            state.lines,
+            vec![
+                "line1\n".to_string(),
+                "line2\n".to_string(),
+                "line3\n".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn paste_then_undo() {
+        let mut state = default_buffer_state();
+        state.lines = vec!["abc\n".to_string()];
+        state.selections = vec![1, 2, 1, 2];
+        push_undo(&mut state);
+        apply_insert_internal(&mut state.lines, &mut state.selections, 1, 2, "XYZ");
+        assert_eq!(state.lines, vec!["aXYZbc\n".to_string()]);
+        undo(&mut state);
+        assert_eq!(state.lines, vec!["abc\n".to_string()]);
+    }
+
+    #[test]
+    fn undo_then_redo_inverse_round_trip() {
+        let mut state = default_buffer_state();
+        state.lines = vec!["start\n".to_string()];
+        state.selections = vec![1, 6, 1, 6];
+        push_undo(&mut state);
+        state.lines[0].insert_str(5, "END");
+        state.selections = vec![1, 9, 1, 9];
+
+        undo(&mut state);
+        assert_eq!(state.lines, vec!["start\n".to_string()]);
+        assert_eq!(state.selections, vec![1, 6, 1, 6]);
+
+        redo(&mut state);
+        assert_eq!(state.lines, vec!["startEND\n".to_string()]);
+        assert_eq!(state.selections, vec![1, 9, 1, 9]);
+    }
+
+    #[test]
+    fn undo_restores_selection_after_delete() {
+        let mut state = default_buffer_state();
+        state.lines = vec!["hello world\n".to_string()];
+        state.selections = vec![1, 1, 1, 6];
+        push_undo(&mut state);
+        delete_selection(&mut state);
+        assert_eq!(state.lines, vec![" world\n".to_string()]);
+        undo(&mut state);
+        assert_eq!(state.lines, vec!["hello world\n".to_string()]);
+        assert_eq!(state.selections, vec![1, 1, 1, 6]);
+    }
+
+    #[test]
+    fn undo_record_is_compact_not_whole_document() {
+        // A one-character edit in a large buffer must store a record sized
+        // to the edit, not to the document.
+        let mut state = default_buffer_state();
+        let big_line = "x".repeat(100_000);
+        state.lines = vec![format!("{big_line}\n")];
+        state.total_bytes = state.lines[0].len() as u64;
+        push_undo(&mut state);
+        state.lines[0].insert(0, 'A');
+        // Commit the group.
+        push_undo(&mut state);
+        let record_len = state.undo[0].len();
+        assert!(
+            record_len < 1_000,
+            "inverse record was {record_len} bytes for a 100 KB buffer"
+        );
+    }
+
+    #[test]
+    fn delete_selection_clamps_stale_out_of_bounds_range() {
+        let mut state = default_buffer_state();
+        state.lines = vec!["one\n".to_string(), "two\n".to_string()];
+        // A range left over from a larger buffer: line 0 underflows, line 5
+        // is past the end. Must clamp instead of panicking.
+        state.selections = vec![0, 1, 5, 1];
+        delete_selection(&mut state);
+        assert!(!state.lines.is_empty());
+    }
+
+    #[test]
+    fn replace_plain_empty_needle_is_noop() {
+        let (result, count) = replace_plain("hello", "", "X");
+        assert_eq!(result, "hello");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn replace_regex_zero_width_multibyte_preserves_codepoints() {
+        // Word boundaries are zero-width; the text holds multi-byte chars.
+        // Byte-stepping over a zero-width match would slice mid-codepoint
+        // and panic - the codepoint-aware advance must keep them intact.
+        let (result, count) = replace_regex("héllo wörld", r"\b", "|").unwrap();
+        assert!(count > 0);
+        assert!(result.contains('é'));
+        assert!(result.contains('ö'));
     }
 }
