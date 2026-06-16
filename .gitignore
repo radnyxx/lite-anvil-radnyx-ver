@@ -1,5 +1,9 @@
 # Rust
-.cargo/
+# Ignore local/credential cruft under .cargo/, but keep the committed
+# build config: CI and the release workflow rely on its +crt-static and
+# static-linking settings (see .github/workflows/release.yml).
+.cargo/*
+!.cargo/config.toml
 
 # Rust build output — covers debug, release, docs, and all profiles.
 target/

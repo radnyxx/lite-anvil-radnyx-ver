@@ -245,12 +245,11 @@ dependencies = [
 
 [[package]]
 name = "freetype-sys"
-version = "0.23.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eab537ce43cab850c64b4cdc390ce7e4f47f877485ddc323208e268280c308ae"
+checksum = "a3075fdee2800239ef5ec39f65df6a8ec907e92a1db7e2b39b5624b3cd2565f4"
 dependencies = [
  "cc",
- "libz-sys",
  "pkg-config",
 ]
 
@@ -393,18 +392,6 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
-
-[[package]]
-name = "libz-sys"
-version = "1.1.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85bc9657773828b90eeb625adff10eeac83cc21bbfd8e23a03eaa8a33c9e28d9"
-dependencies = [
- "cc",
- "libc",
- "pkg-config",
- "vcpkg",
-]
 
 [[package]]
 name = "lite-anvil"

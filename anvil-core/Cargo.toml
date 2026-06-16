@@ -44,7 +44,14 @@ sdl3-sys = { version = "0.6.3", features = [
     "no-sdl-power",
 ], optional = true }
 fontdue = "0.9.3"
-freetype-sys = { version = "0.23", features = ["bundled"] }
+# Pinned below 0.23: the `bundled` feature in 0.20-0.22 compiles a lean
+# FreeType from source (PNG/BZIP2/Brotli/HarfBuzz off, FreeType's built-in
+# gzip in place of libz), which is exactly the self-contained static build
+# this workspace wants on every platform. 0.23's `bundled` additionally
+# compiles a vendored libpng whose `#include "zlib.h"` resolves through a
+# dead relative include path, so it needs system zlib headers it cannot find
+# on Windows MSVC and fails to build there.
+freetype-sys = { version = "0.22.1", features = ["bundled"] }
 notify = "8.2.0"
 pcre2 = "0.2.11"
 pulldown-cmark = { version = "0.12", default-features = false }

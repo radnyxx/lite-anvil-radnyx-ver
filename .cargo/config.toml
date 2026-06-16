@@ -1,0 +1,26 @@
+# Link the MSVC C runtime statically so the Rust binary itself does not
+# depend on VCRUNTIME140.dll / MSVCP140.dll. Users on clean Windows
+# installs would otherwise hit "VCRUNTIME140.dll was not found" before
+# the editor has a chance to run. The Windows release archive still
+# ships the matching redistributable DLLs next to the exe in case any
+# future dynamic dep ends up pulling them in.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Force bundled C-library deps for every build, on every platform, so
+# the editor binary never silently picks up (or drifts with) a system
+# libpcre2 that the host distro happens to provide.
+#   * PCRE2_SYS_STATIC=1 tells `pcre2-sys` to skip pkg-config and build
+#     the vendored PCRE2 source statically. Same regex semantics on
+#     NixOS, Arch, Debian, macOS, and Windows.
+# FreeType is bundled the same way, but through the `bundled` cargo
+# feature on `freetype-sys` (see anvil-core/Cargo.toml), not an env var:
+# the 0.20-0.22 bundled build compiles a lean FreeType from source with
+# PNG / BZIP2 / Brotli / HarfBuzz off and FreeType's built-in gzip in
+# place of libz, so freetype, libpng, libbz2, libz, and libbrotli all
+# drop off the dependency list. The binary grows ~2 MB in return.
+[env]
+PCRE2_SYS_STATIC = "1"
