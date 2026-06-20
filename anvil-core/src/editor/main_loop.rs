@@ -12555,7 +12555,7 @@ fn handle_doc_command(
     let mut prev_cursor_line: usize = 0;
     let _ = buffer::with_buffer_mut(buf_id, |b| {
         let anchor_line = *b.selections.first().unwrap_or(&1);
-        let anchor_col = *b.selections.get(1).unwrap_or(&1);
+        let mut anchor_col = *b.selections.get(1).unwrap_or(&1);
         let cursor_line = *b.selections.get(2).unwrap_or(&anchor_line);
         let cursor_col = *b.selections.get(3).unwrap_or(&anchor_col);
         prev_cursor_line = cursor_line;
@@ -12563,6 +12563,8 @@ fn handle_doc_command(
 
         // Selection: shift variants move cursor but keep anchor.
         let is_select = cmd.starts_with("doc:select-to-");
+        let mut preserve_anchor = false;
+        let mut handled = true;
 
         // Movement always operates on the cursor position.
         let mut line = cursor_line;
@@ -12979,10 +12981,24 @@ fn handle_doc_command(
                 } else {
                     " ".repeat(indent_size)
                 };
-                let l = &mut b.lines[line - 1];
-                let byte_pos = char_to_byte(l, col - 1);
-                l.insert_str(byte_pos, &indent_str);
-                col += indent_str.chars().count();
+                let indent_len = indent_str.chars().count();
+                if anchor_line != cursor_line {
+                    let (start, end) =
+                        (anchor_line.min(cursor_line), anchor_line.max(cursor_line));
+                    for i in start..=end {
+                        if let Some(l) = b.lines.get_mut(i - 1) {
+                            l.insert_str(0, &indent_str);
+                        }
+                    }
+                    col += indent_len;
+                    anchor_col += indent_len;
+                    preserve_anchor = true;
+                } else {
+                    let l = &mut b.lines[line - 1];
+                    let byte_pos = char_to_byte(l, col - 1);
+                    l.insert_str(byte_pos, &indent_str);
+                    col += indent_len;
+                }
             }
             "core:sort-lines" => {
                 buffer::push_undo(b);
@@ -13219,6 +13235,10 @@ fn handle_doc_command(
                     }
                 }
                 col = col.saturating_sub(indent_size).max(1);
+                if anchor_line != cursor_line {
+                    anchor_col = anchor_col.saturating_sub(indent_size).max(1);
+                    preserve_anchor = true;
+                }
             }
             "doc:join-lines" => {
                 buffer::push_undo(b);
@@ -13237,7 +13257,13 @@ fn handle_doc_command(
                     l.push('\n');
                 }
             }
-            _ => {}
+            _ => {
+                handled = false;
+            }
+        }
+
+        if !handled {
+            return Ok(());
         }
 
         // Collapse to single cursor when a non-create-cursor command runs.
@@ -13245,8 +13271,9 @@ fn handle_doc_command(
             buffer::remove_extra_cursors(b);
         }
 
-        // Update selections: select commands keep anchor, move commands collapse.
-        if is_select {
+        // Update selections: select commands and indent/unindent keep anchor,
+        // move commands collapse.
+        if is_select || preserve_anchor {
             b.selections[0] = anchor_line;
             b.selections[1] = anchor_col;
         } else {

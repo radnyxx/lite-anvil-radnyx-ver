@@ -1,5 +1,9 @@
 # Change Log
 
+## [2.12.2] - 2026-06-19 -- Fix multi line selection indentation.
+
+* Indenting selected text would only indent the line at the cursor. Fixed.
+
 ## [2.12.1] - 2026-06-16 -- Crash, stability, and responsiveness hardening; dependency refresh.
 
 * Fixed three editor-killing crashes reachable from untrusted input (with `panic = "abort"` each lost unsaved work): a negative 256-color terminal escape (`\x1b[38;5;-1m`), a malformed or oversized LSP `Content-Length` header, and a "replace all" with an empty-matchable pattern (`.*`, `\s*`, `$`). Also hardened a stale-selection out-of-bounds in cut/paste/case-change and a UTF-8 boundary slice in regex replace.
